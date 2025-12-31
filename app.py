@@ -139,7 +139,7 @@ class AmbilightApp:
         mode_combo = ttk.Combobox(
             cap_frame,
             textvariable=self.capture_mode,
-            values=["Screen Map", "Average Color"],
+            values=["Screen Map", "Average Color", "Dominant Color"],
             state="readonly",
             width=15,
         )
@@ -621,6 +621,66 @@ class AmbilightApp:
 
                     if frame_count % 30 == 0:
                         log_colors.append(f"ALL:({r},{g},{b})")
+
+                elif mode == "Dominant Color":
+                    # Extract the most vibrant/prominent color from the screen
+                    # This gives the "vibe" of what's on screen - perfect for stand lamps
+                    
+                    # Reshape pixels for processing
+                    flat_pixels = pixels.reshape(-1, 3)
+                    
+                    # Convert RGB to HSV-like values to find saturation
+                    # Saturation = (max - min) / max for each pixel
+                    max_vals = np.max(flat_pixels, axis=1)
+                    min_vals = np.min(flat_pixels, axis=1)
+                    
+                    # Calculate saturation (0-255 scale)
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        saturation = np.where(max_vals > 0, 
+                                            ((max_vals - min_vals) * 255) / max_vals, 
+                                            0).astype(np.uint8)
+                    
+                    # Filter: only keep pixels with good saturation (colorful, not gray)
+                    # Also filter out very dark and very bright pixels
+                    brightness_vals = max_vals
+                    
+                    # Mask for "colorful" pixels: saturation > 50, brightness between 30-240
+                    colorful_mask = (saturation > 50) & (brightness_vals > 30) & (brightness_vals < 240)
+                    
+                    if np.any(colorful_mask):
+                        colorful_pixels = flat_pixels[colorful_mask]
+                        colorful_saturations = saturation[colorful_mask]
+                        
+                        # Weight pixels by their saturation (more saturated = more weight)
+                        # This picks the most vibrant color that's also common
+                        weights = colorful_saturations.astype(float) / 255.0
+                        
+                        # Weighted average of the colorful pixels
+                        weighted_sum = np.sum(colorful_pixels * weights[:, np.newaxis], axis=0)
+                        total_weight = np.sum(weights)
+                        
+                        if total_weight > 0:
+                            dominant = (weighted_sum / total_weight).astype(int)
+                        else:
+                            dominant = np.mean(colorful_pixels, axis=0).astype(int)
+                        
+                        r_raw, g_raw, b_raw = dominant[0], dominant[1], dominant[2]
+                    else:
+                        # Fallback to average if no colorful pixels found
+                        avg_color = np.mean(flat_pixels, axis=0).astype(int)
+                        r_raw, g_raw, b_raw = avg_color[0], avg_color[1], avg_color[2]
+                    
+                    # Apply brightness
+                    r = int(r_raw * brightness / 255)
+                    g = int(g_raw * brightness / 255)
+                    b = int(b_raw * brightness / 255)
+                    
+                    # Set same dominant color for all LEDs
+                    for i in range(self.num_leds):
+                        led_colors.extend([r, g, b])
+                    
+                    if frame_count % 30 == 0:
+                        log_colors.append(f"DOMINANT:({r},{g},{b})")
 
                 else:  # Screen Map
                     for i, led in enumerate(self.led_positions):
