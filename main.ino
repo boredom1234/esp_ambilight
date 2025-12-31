@@ -5,79 +5,91 @@
 #include <Preferences.h>
 #include <ArduinoJson.h>
 
-// WiFi Configuration - CHANGE THESE!
-const char* ssid = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASSWORD";
-
-// LED Configuration
+// --- Configuration Constants ---
 #define LED_PIN     5
-#define NUM_LEDS    60
 #define LED_TYPE    WS2812B
 #define COLOR_ORDER GRB
+#define MAX_LEDS    300       // Maximum possible LEDs (memory limit)
+#define AP_SSID     "ESP32-Ambilight-Config"
+#define AP_PASS     ""        // Open AP for configuration
+
+// --- Global Variables ---
+CRGB leds[MAX_LEDS];
+int numLedsConfig = 60;       // Current active LED count
+String wifi_ssid = "";
+String wifi_pass = "";
+
+// State
+bool calibrationMode = false;
+int highlightLED = -1;
+uint8_t currentBrightness = 255;
 
 // Server instances
 AsyncWebServer server(80);
 WebSocketsServer webSocket(81);
 Preferences preferences;
 
-// LED data
-CRGB leds[NUM_LEDS];
-bool calibrationMode = false;
-int highlightLED = -1;
-uint8_t currentBrightness = 255;
-
-// LED mapping - stores normalized screen coordinates (0-255 for each axis)
-// Supports any LED arrangement: strip, matrix, spiral, freeform, etc.
+// LED mapping
 struct LEDMapping {
-  uint8_t screenX;  // 0-255 normalized X position
-  uint8_t screenY;  // 0-255 normalized Y position
+  uint8_t screenX;
+  uint8_t screenY;
 };
-LEDMapping ledMap[NUM_LEDS];
+LEDMapping ledMap[MAX_LEDS];
+
+// Function Prototypes
+void loadSettings();
+void saveSettings(); 
+void setupWebServer();
+void startAPMode();
 
 void setup() {
   Serial.begin(115200);
   
+  // Initialize Preferences
+  preferences.begin("ambilight", false);
+  loadSettings();
+  loadLEDMapping(); // Load mapping separately
+  
   // Initialize LED strip
-  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
+  // Note: We initialize to MAX_LEDS, but only draw up to numLedsConfig
+  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, MAX_LEDS);
   FastLED.setBrightness(currentBrightness);
   FastLED.clear();
   FastLED.show();
   
-  // Initialize preferences
-  preferences.begin("ambilight", false);
-  loadLEDMapping();
-  
-  // Connect to WiFi
-  Serial.println("Connecting to WiFi...");
-  WiFi.begin(ssid, password);
-  
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi Connected!");
-    Serial.print("IP Address: ");
-    Serial.println(WiFi.localIP());
-    Serial.print("WebSocket Port: 81\n");
+  // WiFi Connection Strategy
+  if (wifi_ssid == "") {
+    Serial.println("No WiFi Configured. Starting AP Mode.");
+    startAPMode();
   } else {
-    Serial.println("\nWiFi Connection Failed!");
-    Serial.println("Starting AP mode...");
-    WiFi.softAP("ESP32-Ambilight", "12345678");
-    Serial.print("AP IP: ");
-    Serial.println(WiFi.softAPIP());
+    Serial.print("Connecting to WiFi: ");
+    Serial.println(wifi_ssid);
+    WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\nWiFi Connected!");
+      Serial.print("IP Address: ");
+      Serial.println(WiFi.localIP());
+    } else {
+      Serial.println("\nConnection Failed. Starting AP Mode.");
+      startAPMode();
+    }
   }
   
-  // Setup WebSocket
+  // Setup Services
   webSocket.begin();
   webSocket.onEvent(webSocketEvent);
   
-  // Setup Web Server
   setupWebServer();
   
+  // Startup Animation (only on active LEDs)
   startupAnimation();
   
   Serial.println("ESP32 Ambilight Ready!");
@@ -86,8 +98,8 @@ void setup() {
 void loop() {
   webSocket.loop();
   
-  // Calibration mode: highlight specific LED
-  if (calibrationMode && highlightLED >= 0) {
+  // Calibration Blink Logic
+  if (calibrationMode && highlightLED >= 0 && highlightLED < numLedsConfig) {
     static unsigned long lastBlink = 0;
     static bool blinkState = false;
     
@@ -103,6 +115,112 @@ void loop() {
   }
 }
 
+// --- Configuration Persistence ---
+
+void loadSettings() {
+  wifi_ssid = preferences.getString("ssid", "");
+  wifi_pass = preferences.getString("pass", "");
+  numLedsConfig = preferences.getInt("leds", 60);
+  
+  if (numLedsConfig > MAX_LEDS) numLedsConfig = MAX_LEDS;
+  if (numLedsConfig < 1) numLedsConfig = 1; # Safetyl
+  
+  Serial.printf("Loaded Settings: SSID='%s', LEDs=%d\n", wifi_ssid.c_str(), numLedsConfig);
+}
+
+void saveConfig(String newSsid, String newPass, int newLeds) {
+  preferences.putString("ssid", newSsid);
+  preferences.putString("pass", newPass);
+  preferences.putInt("leds", newLeds);
+  Serial.println("Settings saved to preferences.");
+}
+
+void saveLEDMapping() {
+  for (int i = 0; i < MAX_LEDS; i++) {
+    String key = "l" + String(i); // Short key to save space
+    uint16_t value = (ledMap[i].screenX << 8) | ledMap[i].screenY;
+    preferences.putUShort(key.c_str(), value);
+  }
+}
+
+void loadLEDMapping() {
+  for (int i = 0; i < MAX_LEDS; i++) {
+    String key = "l" + String(i);
+    uint16_t value = preferences.getUShort(key.c_str(), 0);
+    ledMap[i].screenX = (value >> 8) & 0xFF;
+    ledMap[i].screenY = value & 0xFF;
+  }
+}
+
+void startAPMode() {
+  WiFi.softAP(AP_SSID, AP_PASS);
+  Serial.println("AP Mode Started");
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+}
+
+// --- Web Server ---
+
+void setupWebServer() {
+  // Main Config Page
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    String html = "<!DOCTYPE html><html><head><title>ESP32 Setup</title>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+    html += "<style>body{font-family:Arial;margin:20px;background:#222;color:#eee;}";
+    html += "input,button{display:block;width:100%;padding:10px;margin:10px 0;box-sizing:border-box;}";
+    html += "button{background:#00ff88;border:none;cursor:pointer;color:#000;font-weight:bold;}";
+    html += ".card{background:#333;padding:20px;border-radius:8px;}";
+    html += "h1{color:#00ff88;}</style></head><body>";
+    
+    html += "<div class='card'><h1>⚙️ Device Setup</h1>";
+    
+    // Status Info
+    html += "<p>Mode: <strong>" + String(WiFi.getMode() == WIFI_AP ? "Access Point" : "Station") + "</strong></p>";
+    if (WiFi.getMode() == WIFI_STA) {
+       html += "<p>IP: " + WiFi.localIP().toString() + "</p>";
+    }
+    
+    // Form
+    html += "<form action='/save' method='POST'>";
+    html += "<label>WiFi SSID</label>";
+    html += "<input type='text' name='ssid' value='" + wifi_ssid + "' placeholder='SSID'>";
+    
+    html += "<label>WiFi Password</label>";
+    html += "<input type='password' name='pass' value='" + wifi_pass + "' placeholder='Password'>";
+    
+    html += "<label>Number of LEDs (Max " + String(MAX_LEDS) + ")</label>";
+    html += "<input type='number' name='leds' value='" + String(numLedsConfig) + "' min='1' max='" + String(MAX_LEDS) + "'>";
+    
+    html += "<button type='submit'>Save & Restart</button>";
+    html += "</form></div>";
+    
+    html += "<br><div class='card'><h3>WebSocket Info</h3>";
+    html += "<p>Port: 81</p><p>Status: " + String(webSocket.connectedClients() > 0 ? "Client Connected" : "Idle") + "</p></div>";
+    
+    html += "</body></html>";
+    request->send(200, "text/html", html);
+  });
+
+  // Save Endpoint
+  server.on("/save", HTTP_POST, [](AsyncWebServerRequest *request){
+    String s, p, l;
+    if (request->hasParam("ssid", true)) s = request->getParam("ssid", true)->value();
+    if (request->hasParam("pass", true)) p = request->getParam("pass", true)->value();
+    if (request->hasParam("leds", true)) l = request->getParam("leds", true)->value();
+    
+    saveConfig(s, p, l.toInt());
+    
+    request->send(200, "text/html", "<h1>Saved! Restarting...</h1><script>setTimeout(function(){window.location.href='/';}, 5000);</script>");
+    
+    delay(1000);
+    ESP.restart();
+  });
+  
+  server.begin();
+}
+
+// --- WebSocket Logic ---
+
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
   switch(type) {
     case WStype_DISCONNECTED:
@@ -113,10 +231,10 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
       IPAddress ip = webSocket.remoteIP(num);
       Serial.printf("[%u] Connected from %d.%d.%d.%d\n", num, ip[0], ip[1], ip[2], ip[3]);
       
-      // Send LED count on connection
-      StaticJsonDocument<64> doc;
+      // Send LED count
+      StaticJsonDocument<128> doc;
       doc["type"] = "info";
-      doc["ledCount"] = NUM_LEDS;
+      doc["ledCount"] = numLedsConfig;
       String response;
       serializeJson(doc, response);
       webSocket.sendTXT(num, response);
@@ -124,21 +242,16 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
     }
       
     case WStype_TEXT: {
-      // Handle JSON commands
-      StaticJsonDocument<256> doc;
+      StaticJsonDocument<512> doc; // Increased to 512 for larger mappings
       DeserializationError error = deserializeJson(doc, payload);
       
-      if (error) {
-        Serial.println("JSON parse error");
-        return;
-      }
+      if (error) return;
       
       String cmd = doc["cmd"];
       
       if (cmd == "calibrate_start") {
         calibrationMode = true;
         highlightLED = -1;
-        Serial.println("Calibration mode started");
         webSocket.sendTXT(num, "{\"type\":\"ack\",\"cmd\":\"calibrate_start\"}");
       }
       else if (cmd == "calibrate_end") {
@@ -146,21 +259,19 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
         highlightLED = -1;
         FastLED.clear();
         FastLED.show();
-        Serial.println("Calibration mode ended");
         webSocket.sendTXT(num, "{\"type\":\"ack\",\"cmd\":\"calibrate_end\"}");
       }
       else if (cmd == "highlight") {
         highlightLED = doc["led"];
-        Serial.printf("Highlighting LED %d\n", highlightLED);
       }
       else if (cmd == "save_map") {
         JsonArray mapping = doc["mapping"];
-        for (int i = 0; i < NUM_LEDS && i < mapping.size(); i++) {
+        // Only save what we received, up to limit
+        for (int i = 0; i < numLedsConfig && i < mapping.size(); i++) {
           ledMap[i].screenX = mapping[i]["x"];
           ledMap[i].screenY = mapping[i]["y"];
         }
         saveLEDMapping();
-        Serial.println("LED mapping saved!");
         webSocket.sendTXT(num, "{\"type\":\"ack\",\"cmd\":\"save_map\"}");
       }
       else if (cmd == "test_pattern") {
@@ -176,15 +287,12 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
         FastLED.clear();
         FastLED.show();
       }
-      
       break;
     }
       
     case WStype_BIN: {
-      // Binary data: LED color data
-      // Format: [R1,G1,B1,R2,G2,B2,...]
-      if (!calibrationMode && length >= NUM_LEDS * 3) {
-        for (int i = 0; i < NUM_LEDS; i++) {
+      if (!calibrationMode && length >= numLedsConfig * 3) {
+        for (int i = 0; i < numLedsConfig; i++) {
           int idx = i * 3;
           leds[i].r = payload[idx];
           leds[i].g = payload[idx + 1];
@@ -197,67 +305,23 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
   }
 }
 
-void setupWebServer() {
-  // Serve a simple web page for status
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-    String html = "<!DOCTYPE html><html><head><title>ESP32 Ambilight</title>";
-    html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-    html += "<style>body{font-family:Arial;margin:40px;background:#1a1a1a;color:#fff;}";
-    html += "h1{color:#00ff88;}.info{background:#2a2a2a;padding:20px;border-radius:10px;margin:20px 0;}";
-    html += ".status{color:#00ff88;font-weight:bold;}</style></head><body>";
-    html += "<h1>🎨 ESP32 Ambilight</h1>";
-    html += "<div class='info'>";
-    html += "<p><strong>Status:</strong> <span class='status'>Online</span></p>";
-    html += "<p><strong>IP Address:</strong> " + WiFi.localIP().toString() + "</p>";
-    html += "<p><strong>WebSocket Port:</strong> 81</p>";
-    html += "<p><strong>LED Count:</strong> " + String(NUM_LEDS) + "</p>";
-    html += "<p><strong>WiFi Signal:</strong> " + String(WiFi.RSSI()) + " dBm</p>";
-    html += "</div>";
-    html += "<p>Use the desktop application to control this device.</p>";
-    html += "<p><small>WebSocket URL: ws://" + WiFi.localIP().toString() + ":81</small></p>";
-    html += "</body></html>";
-    request->send(200, "text/html", html);
-  });
-  
-  server.begin();
-  Serial.println("Web server started");
-}
-
-void saveLEDMapping() {
-  for (int i = 0; i < NUM_LEDS; i++) {
-    String key = "led" + String(i);
-    // Pack X (high byte) and Y (low byte) into 16 bits
-    uint16_t value = (ledMap[i].screenX << 8) | ledMap[i].screenY;
-    preferences.putUShort(key.c_str(), value);
-  }
-}
-
-void loadLEDMapping() {
-  for (int i = 0; i < NUM_LEDS; i++) {
-    String key = "led" + String(i);
-    uint16_t value = preferences.getUShort(key.c_str(), 0);
-    ledMap[i].screenX = (value >> 8) & 0xFF;
-    ledMap[i].screenY = value & 0xFF;
-  }
-}
-
 void testPattern() {
-  for (int i = 0; i < NUM_LEDS; i++) {
+  // Test only active LEDs
+  for (int i = 0; i < numLedsConfig; i++) {
     FastLED.clear();
     leds[i] = CRGB::Red;
     FastLED.show();
-    delay(30);
+    delay(20);
   }
-  delay(200);
+  delay(100);
   FastLED.clear();
   FastLED.show();
 }
 
 void startupAnimation() {
-  // Rainbow wave
-  for (int j = 0; j < 255; j += 5) {
-    for (int i = 0; i < NUM_LEDS; i++) {
-      leds[i] = CHSV((i * 255 / NUM_LEDS + j) % 255, 255, 200);
+  for (int j = 0; j < 255; j += 10) {
+    for (int i = 0; i < numLedsConfig; i++) {
+      leds[i] = CHSV((i * 255 / numLedsConfig + j) % 255, 255, 200);
     }
     FastLED.show();
     delay(10);

@@ -12,7 +12,7 @@ class AmbilightApp:
     def __init__(self, root):
         self.root = root
         self.root.title("ESP32 Ambilight Controller (WiFi)")
-        self.root.geometry("900x700")
+        self.root.geometry("900x850")  # Increased height for new controls
 
         self.ws = None
         self.num_leds = 60
@@ -21,6 +21,14 @@ class AmbilightApp:
         self.calibration_mode = False
         self.current_led_index = 0
         self.connected = False
+
+        # Capture Settings
+        self.capture_mode = tk.StringVar(value="Screen Map")
+        self.use_custom_region = tk.BooleanVar(value=False)
+        self.region_x = tk.StringVar(value="25")
+        self.region_y = tk.StringVar(value="25")
+        self.region_w = tk.StringVar(value="50")
+        self.region_h = tk.StringVar(value="50")
 
         self.create_ui()
 
@@ -31,7 +39,7 @@ class AmbilightApp:
 
         ttk.Label(conn_frame, text="ESP32 IP Address:").grid(row=0, column=0, padx=5)
         self.ip_entry = ttk.Entry(conn_frame, width=20)
-        self.ip_entry.insert(0, "192.168.1.100")  # Default IP
+        self.ip_entry.insert(0, "127.0.0.1")  # Default IP
         self.ip_entry.grid(row=0, column=1, padx=5)
 
         ttk.Button(conn_frame, text="Connect", command=self.connect_device).grid(
@@ -118,15 +126,101 @@ class AmbilightApp:
             ctrl_frame,
             textvariable=self.fps_var,
             values=["15", "20", "30", "45", "60"],
-            width=8,
+            width=5,
         )
         fps_combo.pack(side="left", padx=5)
+
+        # Capture Settings Frame
+        cap_frame = ttk.LabelFrame(self.root, text="Capture Settings", padding=10)
+        cap_frame.pack(fill="x", padx=10, pady=5)
+
+        # Mode Selection
+        ttk.Label(cap_frame, text="Mode:").grid(row=0, column=0, padx=5)
+        mode_combo = ttk.Combobox(
+            cap_frame,
+            textvariable=self.capture_mode,
+            values=["Screen Map", "Average Color"],
+            state="readonly",
+            width=15,
+        )
+        mode_combo.grid(row=0, column=1, padx=5)
+
+        # Custom Region
+        tk.Checkbutton(
+            cap_frame,
+            text="Use Custom Region",
+            variable=self.use_custom_region,
+            command=self.toggle_region_inputs,
+        ).grid(row=0, column=2, padx=15)
+
+        self.reg_frame = ttk.Frame(cap_frame)
+        self.reg_frame.grid(row=0, column=3, padx=5)
+
+        # Region Inputs
+        validate_cmd = (self.root.register(self.validate_percent), "%P")
+
+        ttk.Label(self.reg_frame, text="X%:").pack(side="left")
+        self.ent_x = ttk.Entry(
+            self.reg_frame,
+            width=4,
+            textvariable=self.region_x,
+            validate="key",
+            validatecommand=validate_cmd,
+        )
+        self.ent_x.pack(side="left", padx=2)
+
+        ttk.Label(self.reg_frame, text="Y%:").pack(side="left")
+        self.ent_y = ttk.Entry(
+            self.reg_frame,
+            width=4,
+            textvariable=self.region_y,
+            validate="key",
+            validatecommand=validate_cmd,
+        )
+        self.ent_y.pack(side="left", padx=2)
+
+        ttk.Label(self.reg_frame, text="W%:").pack(side="left")
+        self.ent_w = ttk.Entry(
+            self.reg_frame,
+            width=4,
+            textvariable=self.region_w,
+            validate="key",
+            validatecommand=validate_cmd,
+        )
+        self.ent_w.pack(side="left", padx=2)
+
+        ttk.Label(self.reg_frame, text="H%:").pack(side="left")
+        self.ent_h = ttk.Entry(
+            self.reg_frame,
+            width=4,
+            textvariable=self.region_h,
+            validate="key",
+            validatecommand=validate_cmd,
+        )
+        self.ent_h.pack(side="left", padx=2)
+
+        self.toggle_region_inputs()  # Set initial state
 
         # Status bar
         self.status_bar = ttk.Label(
             self.root, text="Ready", relief=tk.SUNKEN, anchor=tk.W
         )
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+    def validate_percent(self, val):
+        if val == "":
+            return True
+        try:
+            v = int(val)
+            return 0 <= v <= 100
+        except ValueError:
+            return False
+
+    def toggle_region_inputs(self):
+        state = "normal" if self.use_custom_region.get() else "disabled"
+        for widget in self.reg_frame.winfo_children():
+            if isinstance(widget, ttk.Entry):
+                widget.config(state=state)
 
     def connect_device(self):
         ip = self.ip_entry.get().strip()
@@ -462,33 +556,102 @@ class AmbilightApp:
     def capture_loop(self):
         fps = int(self.fps_var.get())
         delay = 1.0 / fps
+        frame_count = 0
 
         while self.is_running:
             try:
-                # Capture screen
-                screen = ImageGrab.grab()
-                screen = screen.resize((screen.width // 4, screen.height // 4))
+                # Calculate capture region
+                bbox = None
+                if self.use_custom_region.get():
+                    try:
+                        # Get full screen size
+                        full_screen = (
+                            ImageGrab.grab()
+                        )  # Very fast call just for size if needed
+                        # Or better, use winfo_screenwidth/height but that's per monitor.
+                        # ImageGrab.grab().size is reliable for primary monitor or all monitors depending on OS.
+                        # For simplicity, let's grab full and crop, or calc bbox from full size.
+                        sw, sh = full_screen.size
+
+                        rx = int(int(self.region_x.get()) / 100 * sw)
+                        ry = int(int(self.region_y.get()) / 100 * sh)
+                        rw = int(int(self.region_w.get()) / 100 * sw)
+                        rh = int(int(self.region_h.get()) / 100 * sh)
+
+                        # Clamp
+                        rx = max(0, min(rx, sw - 1))
+                        ry = max(0, min(ry, sh - 1))
+                        rw = max(1, min(rw, sw - rx))
+                        rh = max(1, min(rh, sh - ry))
+
+                        bbox = (rx, ry, rx + rw, ry + rh)
+                    except Exception as e:
+                        print(f"Region calc error: {e}")
+                        bbox = None
+
+                # Capture screen (or region)
+                screen = ImageGrab.grab(bbox=bbox)
+
+                # Resize for performance (keep aspect ratio somewhat or just fixed small size)
+                # 100x100 is plenty for lighting info
+                screen = screen.resize((100, 100))
                 pixels = np.array(screen)
 
                 h, w = pixels.shape[:2]
                 brightness = int(self.brightness_scale.get())
 
-                # Calculate color for each LED
                 led_colors = bytearray()
+                log_colors = []
 
-                for led in self.led_positions:
-                    x = int(led["x"] * (w - 1))
-                    y = int(led["y"] * (h - 1))
+                mode = self.capture_mode.get()
 
-                    # Sample color
-                    color = pixels[y, x]
+                if mode == "Average Color":
+                    # Calculate average color of the captured region
+                    avg_color = np.mean(pixels, axis=(0, 1)).astype(int)
+                    r_raw, g_raw, b_raw = avg_color[0], avg_color[1], avg_color[2]
 
                     # Apply brightness
-                    r = int(color[0] * brightness / 255)
-                    g = int(color[1] * brightness / 255)
-                    b = int(color[2] * brightness / 255)
+                    r = int(r_raw * brightness / 255)
+                    g = int(g_raw * brightness / 255)
+                    b = int(b_raw * brightness / 255)
 
-                    led_colors.extend([r, g, b])
+                    # Set same color for all LEDs
+                    for i in range(self.num_leds):
+                        led_colors.extend([r, g, b])
+
+                    if frame_count % 30 == 0:
+                        log_colors.append(f"ALL:({r},{g},{b})")
+
+                else:  # Screen Map
+                    for i, led in enumerate(self.led_positions):
+                        # Map normalized LED positions (0-1) to the CAPTURED image dimensions
+                        x = int(led["x"] * (w - 1))
+                        y = int(led["y"] * (h - 1))
+
+                        # Sample color
+                        color = pixels[y, x]
+                        r_raw, g_raw, b_raw = (
+                            int(color[0]),
+                            int(color[1]),
+                            int(color[2]),
+                        )
+
+                        # Apply brightness
+                        r = int(r_raw * brightness / 255)
+                        g = int(g_raw * brightness / 255)
+                        b = int(b_raw * brightness / 255)
+
+                        led_colors.extend([r, g, b])
+
+                        if i < 5 and frame_count % 30 == 0:
+                            log_colors.append(f"LED{i}:({r},{g},{b})")
+
+                # Log every 30 frames
+                frame_count += 1
+                if frame_count % 30 == 0:
+                    print(
+                        f"[Frame {frame_count}] Mode: {mode} | Sending: {', '.join(log_colors)}..."
+                    )
 
                 # Send binary data
                 self.send_binary(bytes(led_colors))
