@@ -108,6 +108,17 @@ const unsigned long SIGNAL_TIMEOUT_MS = 3000;  // 3 seconds without data = turn 
 bool ledsActive = false;
 String lastActiveSource = "";
 
+// Source arbitration - prevent flickering from concurrent sources
+String activeSource = "";
+unsigned long sourceLockedUntil = 0;
+const unsigned long SOURCE_LOCK_MS = 500;
+
+// Non-blocking JSON parsing buffers
+String serialJsonBuffer = "";
+bool serialJsonMode = false;
+String btJsonBuffer = "";
+bool btJsonMode = false;
+
 // ============================================================================
 // FUNCTION PROTOTYPES
 // ============================================================================
@@ -267,26 +278,40 @@ void handleSerialData() {
         serialBufferIndex = 0;
     }
     
+    // Reset JSON mode on timeout too
+    if (serialJsonMode && (currentTime - lastSerialByte > SERIAL_TIMEOUT_MS)) {
+        serialJsonMode = false;
+        serialJsonBuffer = "";
+    }
+    
     while (Serial.available() > 0) {
         uint8_t b = Serial.read();
         lastSerialByte = currentTime;
+        
+        // Non-blocking JSON handling
+        if (serialJsonMode) {
+            serialJsonBuffer += (char)b;
+            if (b == '}') {
+                processJsonCommand(serialJsonBuffer, "USB");
+                serialJsonBuffer = "";
+                serialJsonMode = false;
+            }
+            // Safety: limit JSON buffer size
+            if (serialJsonBuffer.length() > 512) {
+                serialJsonBuffer = "";
+                serialJsonMode = false;
+            }
+            continue;
+        }
         
         switch (serialSyncState) {
             case 0:  // Waiting for start byte
                 if (b == MAGIC_BYTE_1) {
                     serialSyncState = 1;
                 } else if (b == '{') {
-                    // JSON command - read until '}'
-                    String cmd = "{";
-                    unsigned long jsonStart = millis();
-                    while (millis() - jsonStart < 100) {
-                        if (Serial.available()) {
-                            char c = Serial.read();
-                            cmd += c;
-                            if (c == '}') break;
-                        }
-                    }
-                    processJsonCommand(cmd, "USB");
+                    // Start non-blocking JSON accumulation
+                    serialJsonMode = true;
+                    serialJsonBuffer = "{";
                 }
                 break;
                 
@@ -299,10 +324,17 @@ void handleSerialData() {
                 }
                 break;
                 
-            case 2:  // Reading RGB data
-                serialRgbBuffer[serialBufferIndex++] = b;
+            case 2:  // Reading RGB data with bounds check
+                if (serialBufferIndex < MAX_LEDS * 3) {
+                    serialRgbBuffer[serialBufferIndex++] = b;
+                }
                 if (serialBufferIndex >= numLeds * 3) {
                     serialSyncState = 3;  // Move to checksum verification
+                }
+                // Safety: abort if buffer would overflow
+                if (serialBufferIndex >= MAX_LEDS * 3 && serialSyncState != 3) {
+                    serialSyncState = 0;
+                    serialBufferIndex = 0;
                 }
                 break;
                 
@@ -339,26 +371,40 @@ void handleBluetoothData() {
         btBufferIndex = 0;
     }
     
+    // Reset JSON mode on timeout
+    if (btJsonMode && (currentTime - lastBtByte > SERIAL_TIMEOUT_MS)) {
+        btJsonMode = false;
+        btJsonBuffer = "";
+    }
+    
     while (btSerial.available() > 0) {
         uint8_t b = btSerial.read();
         lastBtByte = currentTime;
+        
+        // Non-blocking JSON handling
+        if (btJsonMode) {
+            btJsonBuffer += (char)b;
+            if (b == '}') {
+                processJsonCommand(btJsonBuffer, "Bluetooth");
+                btJsonBuffer = "";
+                btJsonMode = false;
+            }
+            // Safety: limit JSON buffer size
+            if (btJsonBuffer.length() > 512) {
+                btJsonBuffer = "";
+                btJsonMode = false;
+            }
+            continue;
+        }
         
         switch (btSyncState) {
             case 0:  // Waiting for start byte
                 if (b == MAGIC_BYTE_1) {
                     btSyncState = 1;
                 } else if (b == '{') {
-                    // JSON command
-                    String cmd = "{";
-                    unsigned long jsonStart = millis();
-                    while (millis() - jsonStart < 100) {
-                        if (btSerial.available()) {
-                            char c = btSerial.read();
-                            cmd += c;
-                            if (c == '}') break;
-                        }
-                    }
-                    processJsonCommand(cmd, "Bluetooth");
+                    // Start non-blocking JSON accumulation
+                    btJsonMode = true;
+                    btJsonBuffer = "{";
                 }
                 break;
                 
@@ -371,10 +417,17 @@ void handleBluetoothData() {
                 }
                 break;
                 
-            case 2:  // Reading RGB data
-                btRgbBuffer[btBufferIndex++] = b;
+            case 2:  // Reading RGB data with bounds check
+                if (btBufferIndex < MAX_LEDS * 3) {
+                    btRgbBuffer[btBufferIndex++] = b;
+                }
                 if (btBufferIndex >= numLeds * 3) {
                     btSyncState = 3;
+                }
+                // Safety: abort if buffer would overflow
+                if (btBufferIndex >= MAX_LEDS * 3 && btSyncState != 3) {
+                    btSyncState = 0;
+                    btBufferIndex = 0;
                 }
                 break;
                 
@@ -436,8 +489,9 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
             
         case WStype_BIN:
             // Binary RGB data (no checksum for WebSocket - it has its own integrity)
+            // Clamp to expected size to prevent processing excess data
             if (!calibrationMode && length >= (size_t)(numLeds * 3)) {
-                applyLedColors(payload, length, "WebSocket");
+                applyLedColors(payload, numLeds * 3, "WebSocket");
             }
             break;
     }
@@ -547,18 +601,69 @@ void sendAck(const char* source, const char* cmd, int wsNum) {
 void applyLedColors(uint8_t* rgbData, int dataLen, const char* source) {
     if (calibrationMode) return;  // Don't update during calibration
     
+    unsigned long now = millis();
+    
+    // Source arbitration - prevent flickering from concurrent sources
+    if (activeSource != "" && activeSource != source && now < sourceLockedUntil) {
+        return;  // Another source has the lock, ignore this data
+    }
+    
+    // Take the lock for this source
+    activeSource = source;
+    sourceLockedUntil = now + SOURCE_LOCK_MS;
+    
     int ledCount = dataLen / 3;
     if (ledCount > numLeds) ledCount = numLeds;
     
     for (int i = 0; i < ledCount; i++) {
         int idx = i * 3;
-        leds[i].r = rgbData[idx];
-        leds[i].g = rgbData[idx + 1];
-        leds[i].b = rgbData[idx + 2];
+        uint8_t r = rgbData[idx];
+        uint8_t g = rgbData[idx + 1];
+        uint8_t b = rgbData[idx + 2];
+        
+        // Apply color order based on stored setting
+        // Python sends RGB, we need to map to strip's native order
+        switch (colorOrder) {
+            case 0:  // GRB (default WS2812B) - FastLED expects physical order
+                leds[i].r = r;
+                leds[i].g = g;
+                leds[i].b = b;
+                break;
+            case 1:  // RGB
+                leds[i].r = g;
+                leds[i].g = r;
+                leds[i].b = b;
+                break;
+            case 2:  // BGR
+                leds[i].r = b;
+                leds[i].g = g;
+                leds[i].b = r;
+                break;
+            case 3:  // RBG
+                leds[i].r = r;
+                leds[i].g = b;
+                leds[i].b = g;
+                break;
+            case 4:  // BRG
+                leds[i].r = g;
+                leds[i].g = b;
+                leds[i].b = r;
+                break;
+            case 5:  // GBR
+                leds[i].r = b;
+                leds[i].g = r;
+                leds[i].b = g;
+                break;
+            default:
+                leds[i].r = r;
+                leds[i].g = g;
+                leds[i].b = b;
+                break;
+        }
     }
     
     FastLED.show();
-    lastValidFrame = millis();
+    lastValidFrame = now;
     ledsActive = true;
     lastActiveSource = source;
 }
@@ -684,7 +789,14 @@ void setupWebServer() {
         }
         if (request->hasParam("appass", true)) {
             String newApPass = request->getParam("appass", true)->value();
+            // Must be empty (open) or 8+ chars (WPA2 requirement)
             if (newApPass != "****" && newApPass != apPassword) {
+                if (newApPass.length() > 0 && newApPass.length() < 8) {
+                    // Return error - password too short
+                    request->send(400, "application/json", 
+                        "{\"success\":false,\"error\":\"AP password must be 8+ characters or empty\"}");
+                    return;
+                }
                 apPassword = newApPass;
                 needsRestart = true;
             }

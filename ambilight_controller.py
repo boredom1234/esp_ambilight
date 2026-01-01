@@ -131,10 +131,16 @@ class ConnectionManager:
             self.ws_thread = threading.Thread(target=self.ws.run_forever, daemon=True)
             self.ws_thread.start()
             
-            # Wait a bit for connection
-            time.sleep(1)
+            # Wait for connection with proper timeout
+            timeout = 5.0
+            start = time.time()
+            while not self.connected and (time.time() - start) < timeout:
+                time.sleep(0.1)
             
-            return self.connected
+            if not self.connected:
+                self._error("WebSocket connection timeout")
+                return False
+            return True
             
         except Exception as e:
             self._error(f"WebSocket connection failed: {e}")
@@ -326,6 +332,12 @@ class AmbilightController:
         self.calibration_mode = False
         self.current_led_index = 0
         self.prev_colors = None
+        
+        # Thread safety lock
+        self._lock = threading.Lock()
+        
+        # Screen size cache for custom region
+        self._screen_size = None
         
         # Capture settings
         self.capture_mode = tk.StringVar(value="Screen Map")
@@ -668,12 +680,15 @@ class AmbilightController:
     
     def initialize_led_positions(self):
         """Initialize LED positions with default grid layout."""
-        self.led_positions = []
+        # Trim excess positions if num_leds decreased
+        if len(self.led_positions) > self.num_leds:
+            self.led_positions = self.led_positions[:self.num_leds]
         
+        # Add positions for any missing LEDs using grid layout
         cols = int(np.ceil(np.sqrt(self.num_leds)))
         rows = int(np.ceil(self.num_leds / cols))
         
-        for i in range(self.num_leds):
+        for i in range(len(self.led_positions), self.num_leds):
             row = i // cols
             col = i % cols
             
@@ -882,12 +897,13 @@ class AmbilightController:
     
     def stop_ambilight(self):
         """Stop the ambilight capture loop."""
-        self.is_running = False
+        with self._lock:
+            self.is_running = False
+            self.prev_colors = None
+        
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
         self.status_bar.config(text="Ambilight stopped")
-        
-        self.prev_colors = None
         
         if self.conn.connected:
             self.conn.send_command({"cmd": "clear"})
@@ -904,8 +920,11 @@ class AmbilightController:
                 bbox = None
                 if self.use_custom_region.get():
                     try:
-                        full_screen = ImageGrab.grab()
-                        sw, sh = full_screen.size
+                        # Use cached screen size for efficiency
+                        if self._screen_size is None:
+                            full_screen = ImageGrab.grab()
+                            self._screen_size = full_screen.size
+                        sw, sh = self._screen_size
                         
                         rx = int(int(self.region_x.get() or "0") / 100 * sw)
                         ry = int(int(self.region_y.get() or "0") / 100 * sh)
@@ -958,19 +977,20 @@ class AmbilightController:
                 else:  # Screen Map
                     led_colors = self._process_screen_map(pixels, brightness)
                 
-                # Apply smoothing
+                # Apply smoothing with thread safety
                 smooth_factor = self.smooth_scale.get() / 100.0
                 
-                if self.prev_colors is not None and len(self.prev_colors) == len(led_colors):
-                    smoothed = bytearray(len(led_colors))
-                    for i in range(len(led_colors)):
-                        smoothed[i] = int(
-                            self.prev_colors[i] * smooth_factor +
-                            led_colors[i] * (1 - smooth_factor)
-                        )
-                    led_colors = smoothed
-                
-                self.prev_colors = bytearray(led_colors)
+                with self._lock:
+                    if self.prev_colors is not None and len(self.prev_colors) == len(led_colors):
+                        smoothed = bytearray(len(led_colors))
+                        for i in range(len(led_colors)):
+                            smoothed[i] = int(
+                                self.prev_colors[i] * smooth_factor +
+                                led_colors[i] * (1 - smooth_factor)
+                            )
+                        led_colors = smoothed
+                    
+                    self.prev_colors = bytearray(led_colors)
                 
                 # Send to device
                 self.conn.send_colors(bytes(led_colors))
@@ -1063,7 +1083,7 @@ class AmbilightController:
         leds_per_side = max(1, self.num_leds // 4)
         
         for i in range(self.num_leds):
-            side = i // leds_per_side
+            side = min(3, i // leds_per_side)  # Clamp to 0-3 for 4 sides
             pos = i % leds_per_side
             
             if side == 0:  # Top edge
@@ -1171,12 +1191,18 @@ class AmbilightController:
     
     def _process_screen_map(self, pixels, brightness):
         """Sample screen at each LED's calibrated position."""
+        # Ensure we have positions for all LEDs
+        while len(self.led_positions) < self.num_leds:
+            self.led_positions.append({"x": 0.5, "y": 0.5})
+        
         h, w = pixels.shape[:2]
         sample_radius = 1
         
         led_colors = bytearray()
         
-        for led in self.led_positions:
+        # Only iterate up to num_leds to ensure correct output size
+        for i in range(self.num_leds):
+            led = self.led_positions[i]
             x = int(led["x"] * (w - 1))
             y = int(led["y"] * (h - 1))
             
