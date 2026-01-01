@@ -799,16 +799,30 @@ class USBAmbilightApp:
                         log_colors.append(f"COOL:({r},{g},{b})")
 
                 else:  # Screen Map
+                    # Sample region size for better accuracy (3x3 pixel area)
+                    sample_radius = 1
+                    
                     for i, led in enumerate(self.led_positions):
                         x = int(led["x"] * (w - 1))
                         y = int(led["y"] * (h - 1))
-
-                        color = pixels[y, x]
-                        r_raw, g_raw, b_raw = int(color[0]), int(color[1]), int(color[2])
-
-                        r = int(r_raw * brightness / 255)
-                        g = int(g_raw * brightness / 255)
-                        b = int(b_raw * brightness / 255)
+                        
+                        # Sample a small region around the LED position for accuracy
+                        x_start = max(0, x - sample_radius)
+                        x_end = min(w, x + sample_radius + 1)
+                        y_start = max(0, y - sample_radius)
+                        y_end = min(h, y + sample_radius + 1)
+                        
+                        region = pixels[y_start:y_end, x_start:x_end]
+                        avg_color = np.mean(region, axis=(0, 1)).astype(int)
+                        r_raw, g_raw, b_raw = avg_color[0], avg_color[1], avg_color[2]
+                        
+                        # Black threshold - turn off LEDs for very dark areas
+                        if r_raw + g_raw + b_raw < 15:
+                            r, g, b = 0, 0, 0
+                        else:
+                            r = int(r_raw * brightness / 255)
+                            g = int(g_raw * brightness / 255)
+                            b = int(b_raw * brightness / 255)
 
                         led_colors.extend([r, g, b])
 

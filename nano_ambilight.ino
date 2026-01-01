@@ -41,6 +41,11 @@ int syncState = 0;  // 0=idle, 1=got 0xAD, 2=got 0xDA, 3=reading RGB
 unsigned long lastByteTime = 0;
 const unsigned long TIMEOUT_MS = 30;
 
+// Signal loss detection - turn off LEDs if no valid frame received
+unsigned long lastValidFrameTime = 0;
+const unsigned long SIGNAL_TIMEOUT_MS = 2000;  // 2 seconds without signal = turn off
+bool ledsActive = false;
+
 // JSON command buffer
 char cmdBuffer[64];
 int cmdIndex = 0;
@@ -66,10 +71,20 @@ void setup() {
 }
 
 void loop() {
+  unsigned long currentTime = millis();
+  
   // Timeout - reset state machine if data stream interrupted
-  if (syncState > 0 && (millis() - lastByteTime > TIMEOUT_MS)) {
+  if (syncState > 0 && (currentTime - lastByteTime > TIMEOUT_MS)) {
     syncState = 0;
     bufferIndex = 0;
+  }
+  
+  // Signal loss detection - turn off LEDs if no valid frames
+  if (ledsActive && (currentTime - lastValidFrameTime > SIGNAL_TIMEOUT_MS)) {
+    FastLED.clear();
+    FastLED.show();
+    ledsActive = false;
+    Serial.println("{\"type\":\"signal_lost\"}");
   }
   
   while (Serial.available() > 0) {
@@ -137,6 +152,8 @@ void loop() {
               leds[i].b = rgbBuffer[idx + 2];
             }
             FastLED.show();
+            lastValidFrameTime = millis();
+            ledsActive = true;
           }
           // else: checksum mismatch, discard frame
           
