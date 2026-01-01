@@ -1,3 +1,9 @@
 websocket-client
 numpy
 Pillow
+pyserial
+
+# Optional: Bluetooth support (Windows)
+# pip install PyBluez
+# Note: PyBluez requires Visual C++ Build Tools on Windows
+# For cross-platform BLE, consider: bleak
