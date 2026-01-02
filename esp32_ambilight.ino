@@ -1,10 +1,9 @@
 /*
- * ESP32 Multi-Mode Ambilight Controller
+ * ESP32 Multi-Mode Ambilight Controller (Lite Version)
  * 
  * Supports receiving LED data via:
  * - USB Serial (115200 baud)
  * - WebSocket (port 81)
- * - Bluetooth Classic SPP
  * 
  * All settings configurable via internal AP web interface.
  * 
@@ -19,7 +18,6 @@
  * - Last Byte: checksum (XOR of all RGB bytes)
  * 
  * WebSocket: Same as existing main.ino (JSON commands + binary RGB data)
- * Bluetooth: Same binary protocol as USB
  */
 
 #include <WiFi.h>
@@ -28,7 +26,6 @@
 #include <FastLED.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
-#include <BluetoothSerial.h>
 
 // ============================================================================
 // CONFIGURATION CONSTANTS
@@ -60,26 +57,22 @@ int numLeds = 60;                   // Current active LED count
 String wifiSsid = "";
 String wifiPass = "";
 String apPassword = "";
-String btName = "ESP32-Ambilight";
 uint8_t defaultBrightness = 255;
 uint8_t colorOrder = 0;             // 0=GRB, 1=RGB, 2=BGR, 3=RBG, 4=BRG, 5=GBR
 
 // Connection mode flags (which sources are enabled)
 bool enableUsb = true;
 bool enableWebSocket = true;
-bool enableBluetooth = true;
 
 // Runtime state
 bool calibrationMode = false;
 int highlightLED = -1;
 uint8_t currentBrightness = 255;
 bool wifiConnected = false;
-bool btConnected = false;
 
 // Server instances
 AsyncWebServer webServer(80);
 WebSocketsServer wsServer(81);
-BluetoothSerial btSerial;
 Preferences prefs;
 
 // LED screen mapping storage
@@ -96,28 +89,25 @@ uint8_t serialRgbBuffer[MAX_LEDS * 3];
 unsigned long lastSerialByte = 0;
 const unsigned long SERIAL_TIMEOUT_MS = 50;
 
-// Bluetooth protocol state machine (same as serial)
-int btSyncState = 0;
-int btBufferIndex = 0;
-uint8_t btRgbBuffer[MAX_LEDS * 3];
-unsigned long lastBtByte = 0;
-
 // Signal loss detection
 unsigned long lastValidFrame = 0;
-const unsigned long SIGNAL_TIMEOUT_MS = 3000;  // 3 seconds without data = turn off
+const unsigned long SIGNAL_TIMEOUT_MS = 30000;  // 30 seconds without data = turn off (increased from 5s to prevent flashing during brief drops)
 bool ledsActive = false;
 String lastActiveSource = "";
+bool signalLostMessagePrinted = false;  // Prevent spam
 
 // Source arbitration - prevent flickering from concurrent sources
 String activeSource = "";
 unsigned long sourceLockedUntil = 0;
-const unsigned long SOURCE_LOCK_MS = 500;
+const unsigned long SOURCE_LOCK_MS = 100;  // Reduced from 500ms
 
 // Non-blocking JSON parsing buffers
 String serialJsonBuffer = "";
 bool serialJsonMode = false;
-String btJsonBuffer = "";
-bool btJsonMode = false;
+
+// Debug counters
+unsigned long frameCount = 0;
+unsigned long lastDebugPrint = 0;
 
 // ============================================================================
 // FUNCTION PROTOTYPES
@@ -130,7 +120,6 @@ void loadLEDMapping();
 void setupWebServer();
 void startAPMode();
 void handleSerialData();
-void handleBluetoothData();
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length);
 void applyLedColors(uint8_t* rgbData, int dataLen, const char* source);
 void testPattern();
@@ -143,7 +132,7 @@ String getConfigPageHtml();
 
 void setup() {
     Serial.begin(SERIAL_BAUD);
-    Serial.println("\n=== ESP32 Multi-Mode Ambilight ===");
+    Serial.println("\n=== ESP32 Ambilight (USB + WebSocket) ===");
     
     // Initialize Preferences (NVS storage)
     prefs.begin("ambilight", false);
@@ -185,16 +174,6 @@ void setup() {
         startAPMode();
     }
     
-    // Initialize Bluetooth if enabled
-    if (enableBluetooth) {
-        if (btSerial.begin(btName)) {
-            Serial.printf("Bluetooth started: %s\n", btName.c_str());
-        } else {
-            Serial.println("Bluetooth initialization failed!");
-            enableBluetooth = false;
-        }
-    }
-    
     // Start WebSocket server if enabled
     if (enableWebSocket) {
         wsServer.begin();
@@ -205,14 +184,16 @@ void setup() {
     // Setup web configuration server
     setupWebServer();
     
+    // Initialize lastValidFrame to current time to prevent false signal loss on boot
+    lastValidFrame = millis();
+    
     // Startup animation
     startupAnimation();
     
     Serial.println("\n=== Ready ===");
-    Serial.printf("USB: %s | WebSocket: %s | Bluetooth: %s\n",
+    Serial.printf("USB: %s | WebSocket: %s\n",
         enableUsb ? "ON" : "OFF",
-        enableWebSocket ? "ON" : "OFF",
-        enableBluetooth ? "ON" : "OFF");
+        enableWebSocket ? "ON" : "OFF");
 }
 
 // ============================================================================
@@ -232,11 +213,6 @@ void loop() {
         handleSerialData();
     }
     
-    // Handle Bluetooth data
-    if (enableBluetooth && btSerial.hasClient()) {
-        handleBluetoothData();
-    }
-    
     // Calibration blink logic
     if (calibrationMode && highlightLED >= 0 && highlightLED < numLeds) {
         static unsigned long lastBlink = 0;
@@ -253,12 +229,29 @@ void loop() {
         }
     }
     
-    // Signal loss detection - turn off LEDs if no data received for a while
+    // Signal loss detection - DISABLED to fix rapid flashing issue
+    // The signal loss detection was causing LEDs to flash because it could trigger
+    // between frame updates. LEDs will now stay at last color until manually cleared.
+    // Uncomment below if you want auto-off after timeout (may cause flashing):
+    /*
     if (ledsActive && (currentTime - lastValidFrame > SIGNAL_TIMEOUT_MS)) {
         FastLED.clear();
         FastLED.show();
         ledsActive = false;
-        Serial.printf("Signal lost from %s - LEDs off\n", lastActiveSource.c_str());
+        if (!signalLostMessagePrinted) {
+            Serial.printf("Signal lost from %s - LEDs off\n", lastActiveSource.c_str());
+            signalLostMessagePrinted = true;
+        }
+    }
+    */
+    
+    // Debug: print frame rate every 5 seconds
+    if (currentTime - lastDebugPrint > 5000) {
+        if (frameCount > 0) {
+            Serial.printf("[Stats] Frames received: %lu in 5s (%.1f fps)\n", frameCount, frameCount / 5.0);
+        }
+        frameCount = 0;
+        lastDebugPrint = currentTime;
     }
     
     // Small delay to prevent watchdog issues
@@ -292,7 +285,7 @@ void handleSerialData() {
         if (serialJsonMode) {
             serialJsonBuffer += (char)b;
             if (b == '}') {
-                processJsonCommand(serialJsonBuffer, "USB");
+                processJsonCommand(serialJsonBuffer, "USB", -1);
                 serialJsonBuffer = "";
                 serialJsonMode = false;
             }
@@ -359,98 +352,6 @@ void handleSerialData() {
 }
 
 // ============================================================================
-// BLUETOOTH DATA HANDLING
-// ============================================================================
-
-void handleBluetoothData() {
-    unsigned long currentTime = millis();
-    
-    // Timeout - reset state machine
-    if (btSyncState > 0 && (currentTime - lastBtByte > SERIAL_TIMEOUT_MS)) {
-        btSyncState = 0;
-        btBufferIndex = 0;
-    }
-    
-    // Reset JSON mode on timeout
-    if (btJsonMode && (currentTime - lastBtByte > SERIAL_TIMEOUT_MS)) {
-        btJsonMode = false;
-        btJsonBuffer = "";
-    }
-    
-    while (btSerial.available() > 0) {
-        uint8_t b = btSerial.read();
-        lastBtByte = currentTime;
-        
-        // Non-blocking JSON handling
-        if (btJsonMode) {
-            btJsonBuffer += (char)b;
-            if (b == '}') {
-                processJsonCommand(btJsonBuffer, "Bluetooth");
-                btJsonBuffer = "";
-                btJsonMode = false;
-            }
-            // Safety: limit JSON buffer size
-            if (btJsonBuffer.length() > 512) {
-                btJsonBuffer = "";
-                btJsonMode = false;
-            }
-            continue;
-        }
-        
-        switch (btSyncState) {
-            case 0:  // Waiting for start byte
-                if (b == MAGIC_BYTE_1) {
-                    btSyncState = 1;
-                } else if (b == '{') {
-                    // Start non-blocking JSON accumulation
-                    btJsonMode = true;
-                    btJsonBuffer = "{";
-                }
-                break;
-                
-            case 1:  // Got 0xAD, waiting for 0xDA
-                if (b == MAGIC_BYTE_2) {
-                    btSyncState = 2;
-                    btBufferIndex = 0;
-                } else {
-                    btSyncState = 0;
-                }
-                break;
-                
-            case 2:  // Reading RGB data with bounds check
-                if (btBufferIndex < MAX_LEDS * 3) {
-                    btRgbBuffer[btBufferIndex++] = b;
-                }
-                if (btBufferIndex >= numLeds * 3) {
-                    btSyncState = 3;
-                }
-                // Safety: abort if buffer would overflow
-                if (btBufferIndex >= MAX_LEDS * 3 && btSyncState != 3) {
-                    btSyncState = 0;
-                    btBufferIndex = 0;
-                }
-                break;
-                
-            case 3:  // Verify checksum
-                {
-                    uint8_t checksum = 0;
-                    for (int i = 0; i < numLeds * 3; i++) {
-                        checksum ^= btRgbBuffer[i];
-                    }
-                    
-                    if (checksum == b) {
-                        applyLedColors(btRgbBuffer, numLeds * 3, "Bluetooth");
-                    }
-                    
-                    btSyncState = 0;
-                    btBufferIndex = 0;
-                }
-                break;
-        }
-    }
-}
-
-// ============================================================================
 // WEBSOCKET EVENT HANDLING
 // ============================================================================
 
@@ -472,7 +373,6 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
                 doc["brightness"] = currentBrightness;
                 doc["usbEnabled"] = enableUsb;
                 doc["wsEnabled"] = enableWebSocket;
-                doc["btEnabled"] = enableBluetooth;
                 
                 String response;
                 serializeJson(doc, response);
@@ -489,9 +389,19 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
             
         case WStype_BIN:
             // Binary RGB data (no checksum for WebSocket - it has its own integrity)
-            // Clamp to expected size to prevent processing excess data
-            if (!calibrationMode && length >= (size_t)(numLeds * 3)) {
+            if (calibrationMode) {
+                // Skip during calibration
+            } else if (length >= (size_t)(numLeds * 3)) {
                 applyLedColors(payload, numLeds * 3, "WebSocket");
+                // frameCount++ moved to applyLedColors() for consistency
+            } else {
+                // Size mismatch - print debug info once
+                static unsigned long lastSizeWarning = 0;
+                if (millis() - lastSizeWarning > 2000) {
+                    Serial.printf("[WS] Frame size mismatch: got %u bytes, expected %d (numLeds=%d)\n", 
+                        length, numLeds * 3, numLeds);
+                    lastSizeWarning = millis();
+                }
             }
             break;
     }
@@ -526,8 +436,6 @@ void processJsonCommand(String& cmdStr, const char* source, int wsNum) {
             wsServer.sendTXT(wsNum, response);
         } else if (strcmp(source, "USB") == 0) {
             Serial.println(response);
-        } else if (strcmp(source, "Bluetooth") == 0) {
-            btSerial.println(response);
         }
     }
     else if (cmd == "calibrate_start") {
@@ -589,8 +497,6 @@ void sendAck(const char* source, const char* cmd, int wsNum) {
         wsServer.sendTXT(wsNum, response);
     } else if (strcmp(source, "USB") == 0) {
         Serial.println(response);
-    } else if (strcmp(source, "Bluetooth") == 0) {
-        btSerial.println(response);
     }
 }
 
@@ -599,12 +505,20 @@ void sendAck(const char* source, const char* cmd, int wsNum) {
 // ============================================================================
 
 void applyLedColors(uint8_t* rgbData, int dataLen, const char* source) {
-    if (calibrationMode) return;  // Don't update during calibration
+    // Debug: print first 3 LED colors every 30 frames
+    static int debugCounter = 0;
+    debugCounter++;
+    
+    if (calibrationMode) {
+        if (debugCounter % 30 == 0) Serial.println("[applyLedColors] Skipped - calibration mode");
+        return;  // Don't update during calibration
+    }
     
     unsigned long now = millis();
     
     // Source arbitration - prevent flickering from concurrent sources
     if (activeSource != "" && activeSource != source && now < sourceLockedUntil) {
+        if (debugCounter % 30 == 0) Serial.printf("[applyLedColors] Skipped - source locked by %s\n", activeSource.c_str());
         return;  // Another source has the lock, ignore this data
     }
     
@@ -614,6 +528,13 @@ void applyLedColors(uint8_t* rgbData, int dataLen, const char* source) {
     
     int ledCount = dataLen / 3;
     if (ledCount > numLeds) ledCount = numLeds;
+    
+    // Debug: print every 30 frames
+    if (debugCounter % 30 == 0) {
+        Serial.printf("[applyLedColors] %s: %d LEDs, brightness=%d, first RGB=(%d,%d,%d)\n",
+            source, ledCount, currentBrightness,
+            rgbData[0], rgbData[1], rgbData[2]);
+    }
     
     for (int i = 0; i < ledCount; i++) {
         int idx = i * 3;
@@ -666,6 +587,8 @@ void applyLedColors(uint8_t* rgbData, int dataLen, const char* source) {
     lastValidFrame = now;
     ledsActive = true;
     lastActiveSource = source;
+    signalLostMessagePrinted = false;  // Reset so we can print again if signal is lost
+    frameCount++;  // Moved here to count frames from both USB and WebSocket
 }
 
 // ============================================================================
@@ -676,13 +599,11 @@ void loadSettings() {
     wifiSsid = prefs.getString("ssid", "");
     wifiPass = prefs.getString("pass", "");
     apPassword = prefs.getString("appass", "");
-    btName = prefs.getString("btname", "ESP32-Ambilight");
     numLeds = prefs.getInt("leds", 60);
     defaultBrightness = prefs.getUChar("bright", 255);
     colorOrder = prefs.getUChar("order", 0);
     enableUsb = prefs.getBool("usb", true);
     enableWebSocket = prefs.getBool("ws", true);
-    enableBluetooth = prefs.getBool("bt", true);
     
     // Validate
     if (numLeds > MAX_LEDS) numLeds = MAX_LEDS;
@@ -690,21 +611,19 @@ void loadSettings() {
     
     currentBrightness = defaultBrightness;
     
-    Serial.printf("Settings: SSID='%s', LEDs=%d, USB=%d, WS=%d, BT=%d\n",
-        wifiSsid.c_str(), numLeds, enableUsb, enableWebSocket, enableBluetooth);
+    Serial.printf("Settings: SSID='%s', LEDs=%d, USB=%d, WS=%d\n",
+        wifiSsid.c_str(), numLeds, enableUsb, enableWebSocket);
 }
 
 void saveSettings() {
     prefs.putString("ssid", wifiSsid);
     prefs.putString("pass", wifiPass);
     prefs.putString("appass", apPassword);
-    prefs.putString("btname", btName);
     prefs.putInt("leds", numLeds);
     prefs.putUChar("bright", defaultBrightness);
     prefs.putUChar("order", colorOrder);
     prefs.putBool("usb", enableUsb);
     prefs.putBool("ws", enableWebSocket);
-    prefs.putBool("bt", enableBluetooth);
     
     Serial.println("Settings saved to NVS");
 }
@@ -755,10 +674,8 @@ void setupWebServer() {
         doc["ssid"] = wifiSsid;
         doc["leds"] = numLeds;
         doc["brightness"] = defaultBrightness;
-        doc["btName"] = btName;
         doc["enableUsb"] = enableUsb;
         doc["enableWs"] = enableWebSocket;
-        doc["enableBt"] = enableBluetooth;
         doc["apPassword"] = apPassword.length() > 0 ? "****" : "";
         doc["wifiConnected"] = wifiConnected;
         doc["ip"] = wifiConnected ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
@@ -815,28 +732,12 @@ void setupWebServer() {
             FastLED.setBrightness(currentBrightness);
         }
         
-        // Bluetooth settings
-        if (request->hasParam("btname", true)) {
-            String newBtName = request->getParam("btname", true)->value();
-            if (newBtName.length() > 0 && newBtName != btName) {
-                btName = newBtName;
-                needsRestart = true;  // BT name change requires restart
-            }
-        }
-        
         // Connection mode settings
         if (request->hasParam("enableUsb", true)) {
             enableUsb = request->getParam("enableUsb", true)->value() == "1";
         }
         if (request->hasParam("enableWs", true)) {
             enableWebSocket = request->getParam("enableWs", true)->value() == "1";
-        }
-        if (request->hasParam("enableBt", true)) {
-            bool newBt = request->getParam("enableBt", true)->value() == "1";
-            if (newBt != enableBluetooth) {
-                enableBluetooth = newBt;
-                needsRestart = true;  // BT enable/disable requires restart
-            }
         }
         
         saveSettings();
@@ -870,7 +771,6 @@ void setupWebServer() {
         doc["lastSource"] = lastActiveSource;
         doc["wifiConnected"] = wifiConnected;
         doc["wsClients"] = wsServer.connectedClients();
-        doc["btConnected"] = btSerial.hasClient();
         doc["uptime"] = millis() / 1000;
         
         String response;
@@ -923,9 +823,7 @@ String getConfigPageHtml() {
             border-bottom: 1px solid rgba(255,255,255,0.1);
             padding-bottom: 10px;
         }
-        .form-group {
-            margin-bottom: 15px;
-        }
+        .form-group { margin-bottom: 15px; }
         label {
             display: block;
             margin-bottom: 5px;
@@ -941,10 +839,7 @@ String getConfigPageHtml() {
             color: #fff;
             font-size: 1em;
         }
-        input:focus {
-            outline: none;
-            border-color: #00ff88;
-        }
+        input:focus { outline: none; border-color: #00ff88; }
         .checkbox-group {
             display: flex;
             align-items: center;
@@ -956,10 +851,7 @@ String getConfigPageHtml() {
             height: 20px;
             accent-color: #00ff88;
         }
-        .checkbox-group label {
-            margin: 0;
-            color: #eee;
-        }
+        .checkbox-group label { margin: 0; color: #eee; }
         button {
             width: 100%;
             padding: 14px;
@@ -971,9 +863,7 @@ String getConfigPageHtml() {
             margin-top: 10px;
             transition: transform 0.1s, opacity 0.2s;
         }
-        button:active {
-            transform: scale(0.98);
-        }
+        button:active { transform: scale(0.98); }
         .btn-primary {
             background: linear-gradient(135deg, #00ff88 0%, #00cc6a 100%);
             color: #000;
@@ -1083,14 +973,6 @@ String getConfigPageHtml() {
                 <input type="checkbox" id="enableWs" checked>
                 <label for="enableWs">WebSocket (WiFi)</label>
             </div>
-            <div class="checkbox-group">
-                <input type="checkbox" id="enableBt" checked>
-                <label for="enableBt">Bluetooth Classic</label>
-            </div>
-            <div class="form-group" style="margin-top:15px">
-                <label>Bluetooth Device Name</label>
-                <input type="text" id="btname" placeholder="ESP32-Ambilight">
-            </div>
         </div>
         
         <div class="card">
@@ -1109,10 +991,6 @@ String getConfigPageHtml() {
                     <span id="wsClients">-</span>
                 </div>
                 <div class="inline-status">
-                    <span>Bluetooth</span>
-                    <span id="btStatus">-</span>
-                </div>
-                <div class="inline-status">
                     <span>Uptime</span>
                     <span id="uptime">-</span>
                 </div>
@@ -1127,7 +1005,6 @@ String getConfigPageHtml() {
     <div id="toast" class="toast"></div>
     
     <script>
-        // Load current config on page load
         async function loadConfig() {
             try {
                 const resp = await fetch('/api/config');
@@ -1136,10 +1013,8 @@ String getConfigPageHtml() {
                 document.getElementById('ssid').value = cfg.ssid || '';
                 document.getElementById('leds').value = cfg.leds || 60;
                 document.getElementById('brightness').value = cfg.brightness || 255;
-                document.getElementById('btname').value = cfg.btName || 'ESP32-Ambilight';
                 document.getElementById('enableUsb').checked = cfg.enableUsb;
                 document.getElementById('enableWs').checked = cfg.enableWs;
-                document.getElementById('enableBt').checked = cfg.enableBt;
                 
                 const statusBox = document.getElementById('statusBox');
                 const statusDot = document.getElementById('statusDot');
@@ -1159,7 +1034,6 @@ String getConfigPageHtml() {
             }
         }
         
-        // Update live status
         async function updateStatus() {
             try {
                 const resp = await fetch('/api/status');
@@ -1168,7 +1042,6 @@ String getConfigPageHtml() {
                 document.getElementById('ledsActive').textContent = status.ledsActive ? '✅ Yes' : '❌ No';
                 document.getElementById('lastSource').textContent = status.lastSource || 'None';
                 document.getElementById('wsClients').textContent = status.wsClients;
-                document.getElementById('btStatus').textContent = status.btConnected ? '✅ Connected' : '❌ Not connected';
                 document.getElementById('uptime').textContent = formatUptime(status.uptime);
             } catch (e) {}
         }
@@ -1187,10 +1060,8 @@ String getConfigPageHtml() {
             formData.append('appass', document.getElementById('appass').value);
             formData.append('leds', document.getElementById('leds').value);
             formData.append('brightness', document.getElementById('brightness').value);
-            formData.append('btname', document.getElementById('btname').value);
             formData.append('enableUsb', document.getElementById('enableUsb').checked ? '1' : '0');
             formData.append('enableWs', document.getElementById('enableWs').checked ? '1' : '0');
-            formData.append('enableBt', document.getElementById('enableBt').checked ? '1' : '0');
             
             try {
                 const resp = await fetch('/api/save', { method: 'POST', body: formData });
@@ -1234,7 +1105,6 @@ String getConfigPageHtml() {
             setTimeout(() => toast.className = 'toast', 3000);
         }
         
-        // Initial load
         loadConfig();
         setInterval(updateStatus, 2000);
     </script>

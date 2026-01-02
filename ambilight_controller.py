@@ -1,8 +1,8 @@
 """
-ESP32 Multi-Mode Ambilight Controller
+ESP32 Multi-Mode Ambilight Controller (Lite Version)
 
 Unified Python application that captures screen colors and sends them to
-ESP32 via USB Serial, WebSocket, or Bluetooth.
+ESP32 via USB Serial or WebSocket.
 
 Features:
 - 8 capture modes (Screen Map, Average, Dominant, Edge, Quadrant, Vibrant, Warm/Cool Bias)
@@ -13,7 +13,6 @@ Features:
 
 Requirements:
 - pip install websocket-client pyserial numpy Pillow
-- For Bluetooth: pip install PyBluez (Windows) or pybluez (Linux)
 """
 
 import tkinter as tk
@@ -41,33 +40,25 @@ except ImportError:
     WEBSOCKET_AVAILABLE = False
     print("Warning: websocket-client not installed. WebSocket mode disabled.")
 
-try:
-    import bluetooth
-    BLUETOOTH_AVAILABLE = True
-except ImportError:
-    BLUETOOTH_AVAILABLE = False
-    print("Warning: PyBluez not installed. Bluetooth mode disabled.")
-
 
 # ============================================================================
 # CONNECTION MANAGER - Abstract layer for all connection types
 # ============================================================================
 
 class ConnectionManager:
-    """Manages connections to ESP32 via USB, WebSocket, or Bluetooth."""
+    """Manages connections to ESP32 via USB or WebSocket."""
     
     MAGIC_BYTE_1 = 0xAD
     MAGIC_BYTE_2 = 0xDA
     
     def __init__(self):
-        self.mode = None  # 'usb', 'websocket', 'bluetooth'
+        self.mode = None  # 'usb', 'websocket'
         self.connected = False
         
         # Connection objects
         self.serial_port = None
         self.ws = None
         self.ws_thread = None
-        self.bt_socket = None
         
         # Callbacks
         self.on_connected = None
@@ -89,25 +80,34 @@ class ConnectionManager:
             time.sleep(2)  # Wait for Arduino reset
             self.serial_port.reset_input_buffer()
             
-            # Request device info
-            self.send_command({"cmd": "info"})
-            time.sleep(0.5)
-            
-            # Try to read response
-            if self.serial_port.in_waiting:
-                response = self.serial_port.readline().decode().strip()
-                self._handle_message(response)
-            
+            # Mark as connected first so send_command works
             self.mode = 'usb'
             self.connected = True
             
+            # Request device info with retry
+            for attempt in range(3):
+                print(f"[USB] Requesting device info (attempt {attempt + 1}/3)...")
+                self.serial_port.write((json.dumps({"cmd": "info"}) + "\n").encode())
+                time.sleep(0.5)
+                
+                # Try to read response
+                if self.serial_port.in_waiting:
+                    response = self.serial_port.readline().decode().strip()
+                    print(f"[USB] Response: {response}")
+                    if response.startswith('{'):
+                        self._handle_message(response)
+                        break
+            
             if self.on_connected:
                 self.on_connected('usb', port)
-                
+            
+            print(f"[USB] Connected! LED count: {self.led_count}")
             return True
             
         except Exception as e:
             self._error(f"USB connection failed: {e}")
+            self.connected = False
+            self.mode = None
             return False
     
     def connect_websocket(self, ip: str, port: int = 81) -> bool:
@@ -127,8 +127,11 @@ class ConnectionManager:
                 on_open=self._ws_on_open,
             )
             
-            # Run WebSocket in background thread
-            self.ws_thread = threading.Thread(target=self.ws.run_forever, daemon=True)
+            # Run WebSocket in background thread with keep-alive pings
+            self.ws_thread = threading.Thread(
+                target=lambda: self.ws.run_forever(ping_interval=5, ping_timeout=3),
+                daemon=True
+            )
             self.ws_thread.start()
             
             # Wait for connection with proper timeout
@@ -144,46 +147,6 @@ class ConnectionManager:
             
         except Exception as e:
             self._error(f"WebSocket connection failed: {e}")
-            return False
-    
-    def connect_bluetooth(self, device_name: str) -> bool:
-        """Connect via Bluetooth SPP."""
-        if not BLUETOOTH_AVAILABLE:
-            self._error("PyBluez not installed")
-            return False
-            
-        try:
-            # Search for devices
-            nearby_devices = bluetooth.discover_devices(duration=4, lookup_names=True)
-            target_address = None
-            
-            for addr, name in nearby_devices:
-                if device_name.lower() in name.lower():
-                    target_address = addr
-                    break
-            
-            if not target_address:
-                self._error(f"Device '{device_name}' not found")
-                return False
-            
-            # Connect via RFCOMM
-            self.bt_socket = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
-            self.bt_socket.connect((target_address, 1))  # Channel 1 for SPP
-            self.bt_socket.settimeout(1.0)
-            
-            self.mode = 'bluetooth'
-            self.connected = True
-            
-            if self.on_connected:
-                self.on_connected('bluetooth', device_name)
-            
-            # Request device info
-            self.send_command({"cmd": "info"})
-            
-            return True
-            
-        except Exception as e:
-            self._error(f"Bluetooth connection failed: {e}")
             return False
     
     def disconnect(self):
@@ -203,13 +166,6 @@ class ConnectionManager:
             except:
                 pass
             self.ws = None
-            
-        elif self.mode == 'bluetooth' and self.bt_socket:
-            try:
-                self.bt_socket.close()
-            except:
-                pass
-            self.bt_socket = None
         
         self.mode = None
         
@@ -230,9 +186,6 @@ class ConnectionManager:
             elif self.mode == 'websocket':
                 self.ws.send(data)
                 
-            elif self.mode == 'bluetooth':
-                self.bt_socket.send((data + "\n").encode())
-                
             return True
             
         except Exception as e:
@@ -250,7 +203,7 @@ class ConnectionManager:
                 self.ws.send(rgb_data, opcode=websocket.ABNF.OPCODE_BINARY)
                 
             else:
-                # USB and Bluetooth use framed protocol with checksum
+                # USB uses framed protocol with checksum
                 checksum = 0
                 for b in rgb_data:
                     checksum ^= b
@@ -259,8 +212,6 @@ class ConnectionManager:
                 
                 if self.mode == 'usb':
                     self.serial_port.write(frame)
-                elif self.mode == 'bluetooth':
-                    self.bt_socket.send(frame)
                     
             return True
             
@@ -272,6 +223,7 @@ class ConnectionManager:
     def _ws_on_open(self, ws):
         self.mode = 'websocket'
         self.connected = True
+        print(f"[WS] Connection opened, waiting for device info...")
         if self.on_connected:
             self.on_connected('websocket', '')
     
@@ -293,6 +245,7 @@ class ConnectionManager:
             
             if msg_type in ["info", "ready"]:
                 self.led_count = data.get("ledCount", 60)
+                print(f"[WS] Device info received: {self.led_count} LEDs")
                 
             if self.on_message:
                 self.on_message(data)
@@ -316,7 +269,7 @@ class AmbilightController:
     def __init__(self, root):
         self.root = root
         self.root.title("ESP32 Ambilight Controller")
-        self.root.geometry("950x900")
+        self.root.geometry("950x850")
         
         # Connection manager
         self.conn = ConnectionManager()
@@ -371,8 +324,6 @@ class AmbilightController:
             modes.append("USB")
         if WEBSOCKET_AVAILABLE:
             modes.append("WebSocket")
-        if BLUETOOTH_AVAILABLE:
-            modes.append("Bluetooth")
         
         if not modes:
             modes = ["USB"]  # Fallback
@@ -398,13 +349,6 @@ class AmbilightController:
         self.ip_entry.insert(0, "192.168.4.1")
         self.ip_entry.pack(side="left", padx=5)
         
-        # Bluetooth settings
-        self.bt_frame = ttk.Frame(conn_frame)
-        ttk.Label(self.bt_frame, text="Device:").pack(side="left", padx=5)
-        self.bt_entry = ttk.Entry(self.bt_frame, width=20)
-        self.bt_entry.insert(0, "ESP32-Ambilight")
-        self.bt_entry.pack(side="left", padx=5)
-        
         # Connect/Disconnect buttons
         btn_frame = ttk.Frame(conn_frame)
         btn_frame.pack(fill="x", pady=5)
@@ -414,6 +358,17 @@ class AmbilightController:
         
         self.status_label = ttk.Label(btn_frame, text="Not Connected", foreground="red")
         self.status_label.pack(side="left", padx=20)
+        
+        # Manual LED count override
+        led_frame = ttk.Frame(conn_frame)
+        led_frame.pack(fill="x", pady=5)
+        ttk.Label(led_frame, text="LED Count:").pack(side="left", padx=5)
+        self.led_count_var = tk.StringVar(value="60")
+        self.led_count_entry = ttk.Entry(led_frame, width=6, textvariable=self.led_count_var)
+        self.led_count_entry.pack(side="left", padx=5)
+        ttk.Button(led_frame, text="Apply", command=self.apply_led_count).pack(side="left", padx=5)
+        self.led_count_label = ttk.Label(led_frame, text="(synced from device)", foreground="gray")
+        self.led_count_label.pack(side="left", padx=5)
         
         # Show USB frame by default
         self._on_mode_change(None)
@@ -546,15 +501,12 @@ class AmbilightController:
         # Hide all frames
         self.usb_frame.pack_forget()
         self.ws_frame.pack_forget()
-        self.bt_frame.pack_forget()
         
         # Show appropriate frame
         if mode == "USB":
             self.usb_frame.pack(fill="x", pady=5)
         elif mode == "WebSocket":
             self.ws_frame.pack(fill="x", pady=5)
-        elif mode == "Bluetooth":
-            self.bt_frame.pack(fill="x", pady=5)
     
     def refresh_ports(self):
         """Refresh available COM ports."""
@@ -598,6 +550,21 @@ class AmbilightController:
         if hasattr(self, 'smooth_label'):
             self.smooth_label.config(text=f"{smooth}%")
     
+    def apply_led_count(self):
+        """Apply manual LED count override."""
+        try:
+            new_count = int(self.led_count_var.get())
+            if 1 <= new_count <= 300:
+                self.num_leds = new_count
+                self.initialize_led_positions()
+                self.led_count_label.config(text=f"(manually set to {new_count})", foreground="orange")
+                print(f"[App] LED count manually set to {new_count}")
+                messagebox.showinfo("Success", f"LED count set to {new_count}")
+            else:
+                messagebox.showerror("Error", "LED count must be 1-300")
+        except ValueError:
+            messagebox.showerror("Error", "Invalid LED count")
+    
     # ===== Connection Methods =====
     
     def connect_device(self):
@@ -631,20 +598,6 @@ class AmbilightController:
                 self.status_label.config(text=f"Connected (WS: {ip})", foreground="green")
             else:
                 self.status_label.config(text="Connection Failed", foreground="red")
-                
-        elif mode == "Bluetooth":
-            device = self.bt_entry.get().strip()
-            if not device:
-                messagebox.showwarning("Warning", "Please enter Bluetooth device name")
-                return
-            
-            self.status_label.config(text="Scanning...", foreground="orange")
-            self.root.update()
-            
-            if self.conn.connect_bluetooth(device):
-                self.status_label.config(text=f"Connected (BT: {device})", foreground="green")
-            else:
-                self.status_label.config(text="Connection Failed", foreground="red")
     
     def disconnect_device(self):
         """Disconnect from device."""
@@ -656,9 +609,13 @@ class AmbilightController:
         self.num_leds = self.conn.led_count
         self.initialize_led_positions()
         
-        self.root.after(0, lambda: self.info_label.config(
-            text=f"Connected! Found {self.num_leds} LEDs. Ready to calibrate."
-        ))
+        def update_ui():
+            self.info_label.config(text=f"Connected! Found {self.num_leds} LEDs. Ready to calibrate.")
+            if hasattr(self, 'led_count_var'):
+                self.led_count_var.set(str(self.num_leds))
+            if hasattr(self, 'led_count_label'):
+                self.led_count_label.config(text=f"(synced: {self.num_leds})", foreground="green")
+        self.root.after(0, update_ui)
     
     def _on_disconnected(self):
         """Callback when disconnected."""
@@ -669,8 +626,19 @@ class AmbilightController:
     def _on_message(self, data):
         """Handle message from device."""
         if data.get("type") == "info":
-            self.num_leds = data.get("ledCount", 60)
-            self.initialize_led_positions()
+            new_led_count = data.get("ledCount", 60)
+            if new_led_count != self.num_leds:
+                print(f"[App] Updating LED count: {self.num_leds} -> {new_led_count}")
+                self.num_leds = new_led_count
+                self.initialize_led_positions()
+            
+            # Update UI on the main thread
+            def update_ui():
+                if hasattr(self, 'led_count_var'):
+                    self.led_count_var.set(str(new_led_count))
+                if hasattr(self, 'led_count_label'):
+                    self.led_count_label.config(text=f"(synced: {new_led_count})", foreground="green")
+            self.root.after(0, update_ui)
     
     def _on_error(self, error):
         """Handle connection error."""
@@ -834,7 +802,6 @@ class AmbilightController:
             "connection_mode": self.connection_mode.get(),
             "com_port": self.port_combo.get() if hasattr(self, 'port_combo') else "",
             "ip_address": self.ip_entry.get() if hasattr(self, 'ip_entry') else "",
-            "bt_device": self.bt_entry.get() if hasattr(self, 'bt_entry') else "",
         }
         
         try:
@@ -866,10 +833,6 @@ class AmbilightController:
             if "ip_address" in config:
                 self.ip_entry.delete(0, tk.END)
                 self.ip_entry.insert(0, config["ip_address"])
-            
-            if "bt_device" in config:
-                self.bt_entry.delete(0, tk.END)
-                self.bt_entry.insert(0, config["bt_device"])
             
             self.draw_led_map()
             messagebox.showinfo("Success", "Configuration loaded")
