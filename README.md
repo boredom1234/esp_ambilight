@@ -26,6 +26,21 @@ A high-performance, multi-mode ambient lighting system developed for ESP32 micro
   - Data line resistor (330Ω) recommended.
   - Power filtering capacitor (1000µF) recommended.
 
+### Wiring Diagram
+
+```text
+   [ POWER SUPPLY ]                   [ ESP32 ]                    [ LED STRIP ]
+  +----------------+              +---------------+              +----------------+
+  | 5V (+) --------+------------->| VIN           |      +------>| 5V             |
+  |                |              |               |      |       |                |
+  | GND (-) -------+-----+------->| GND           |      +------>| GND            |
+  +----------------+     |        |               |              |                |
+                         |        |         GPIO5 |----[330Ω]--->| DIN            |
+                         |        +---------------+              +----------------+
+                         |
+                   (Common Ground)
+```
+
 ## Software Prerequisites
 
 ### Firmware
