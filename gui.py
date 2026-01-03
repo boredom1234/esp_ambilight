@@ -12,6 +12,7 @@ import config
 from connection_manager import ConnectionManager, SERIAL_AVAILABLE, WEBSOCKET_AVAILABLE
 import image_processor
 import effects
+from network_scanner import NetworkScanner
 
 # Optional import for system tray
 try:
@@ -44,7 +45,7 @@ class AmbilightController:
     def __init__(self, root):
         self.root = root
         self.root.title("ESP32 Ambilight Controller")
-        self.root.geometry("1050x950")
+        self.root.geometry("1920x1080")
         self.root.minsize(900, 800)
 
         # Apply theme if not already applied (in case root passed from main is not ttk.Window)
@@ -190,9 +191,29 @@ class AmbilightController:
         # WebSocket settings
         self.ws_frame = ttk.Frame(conn_frame)
         ttk.Label(self.ws_frame, text="IP Address:").pack(side="left", padx=5)
-        self.ip_entry = ttk.Entry(self.ws_frame, width=15)
-        self.ip_entry.insert(0, config.DEFAULT_IP)
-        self.ip_entry.pack(side="left", padx=5)
+
+        # Device dropdown with manual entry support
+        self.ip_var = tk.StringVar(value=config.DEFAULT_IP)
+        self.ip_combo = ttk.Combobox(self.ws_frame, textvariable=self.ip_var, width=20)
+        self.ip_combo.pack(side="left", padx=5)
+
+        # Scan button
+        self.scan_btn = ttk.Button(
+            self.ws_frame,
+            text="🔍 Scan",
+            width=8,
+            command=self.scan_network,
+            bootstyle="info-outline",
+        )
+        self.scan_btn.pack(side="left", padx=5)
+
+        # Scan progress label
+        self.scan_status_label = ttk.Label(self.ws_frame, text="", foreground="gray")
+        self.scan_status_label.pack(side="left", padx=5)
+
+        # Network scanner instance
+        self.network_scanner = NetworkScanner()
+        self.discovered_devices = []
 
         # Connect/Disconnect buttons
         btn_frame = ttk.Frame(conn_frame)
@@ -757,9 +778,14 @@ class AmbilightController:
                 self.status_label.config(text="Connection Failed", foreground="red")
 
         elif mode == "WebSocket":
-            ip = self.ip_entry.get().strip()
+            ip = self.ip_var.get().strip()
+            # Extract just the IP if format is "Label (IP)"
+            if "(" in ip and ")" in ip:
+                ip = ip.split("(")[1].split(")")[0]
             if not ip:
-                messagebox.showwarning("Warning", "Please enter IP address")
+                messagebox.showwarning(
+                    "Warning", "Please enter IP address or scan for devices"
+                )
                 return
 
             self.status_label.config(text="Connecting...", foreground="orange")
@@ -776,6 +802,69 @@ class AmbilightController:
         """Disconnect from device."""
         self.conn.disconnect()
         self.status_label.config(text="Not Connected", foreground="red")
+
+    # ===== Network Scanning Methods =====
+
+    def scan_network(self):
+        """Start scanning the local network for ESP Ambilight devices."""
+        if self.network_scanner.scanning:
+            # Stop current scan
+            self.network_scanner.stop_scan()
+            self.scan_btn.config(text="🔍 Scan")
+            self.scan_status_label.config(text="Scan stopped", foreground="orange")
+            return
+
+        # Clear previous results
+        self.discovered_devices = []
+        self.ip_combo["values"] = []
+        self.scan_btn.config(text="⏹ Stop")
+        self.scan_status_label.config(text="Scanning...", foreground="blue")
+
+        def on_progress(current, total):
+            self.root.after(
+                0,
+                lambda: self.scan_status_label.config(
+                    text=f"Scanning: {current}/{total}", foreground="blue"
+                ),
+            )
+
+        def on_device_found(device):
+            self.discovered_devices.append(device)
+            self.root.after(0, self._update_device_dropdown)
+
+        def on_complete(devices):
+            self.root.after(0, lambda: self._on_scan_complete(devices))
+
+        self.network_scanner.scan_network(
+            on_progress=on_progress,
+            on_device_found=on_device_found,
+            on_complete=on_complete,
+        )
+
+    def _update_device_dropdown(self):
+        """Update the device dropdown with discovered devices."""
+        values = []
+        for device in self.discovered_devices:
+            label = f"ESP Ambilight ({device['ip']})"
+            values.append(label)
+        self.ip_combo["values"] = values
+        if values and not self.ip_var.get():
+            self.ip_var.set(values[0])
+
+    def _on_scan_complete(self, devices):
+        """Handle scan completion."""
+        self.scan_btn.config(text="🔍 Scan")
+        count = len(devices)
+        if count == 0:
+            self.scan_status_label.config(text="No devices found", foreground="orange")
+        elif count == 1:
+            self.scan_status_label.config(text="1 device found ✓", foreground="green")
+            # Auto-select the only device
+            self.ip_var.set(f"ESP Ambilight ({devices[0]['ip']})")
+        else:
+            self.scan_status_label.config(
+                text=f"{count} devices found ✓", foreground="green"
+            )
 
     def _on_connected(self, mode, details):
         """Callback when connection established."""
