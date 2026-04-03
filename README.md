@@ -61,6 +61,7 @@ A high-performance, multi-mode ambient lighting system developed for ESP32 micro
   - `Pillow`
   - `pyserial`
   - `websocket-client`
+  - `dxcam` (Windows, recommended for lowest screen-capture latency)
 
 ## Installation
 
@@ -79,6 +80,8 @@ A high-performance, multi-mode ambient lighting system developed for ESP32 micro
     ```bash
     pip install -r requirements.txt
     ```
+3.  For best real-time performance on Windows, ensure `dxcam` installs successfully.
+4.  In the app, you can choose capture backend in **Settings -> Capture Backend** (`Auto`, `DXCam`, `Pillow`).
 
 ## Usage
 

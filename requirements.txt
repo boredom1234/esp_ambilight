@@ -2,6 +2,7 @@ websocket-client
 numpy
 Pillow
 pyserial
+dxcam; platform_system == "Windows"
 
 # Optional: Bluetooth support (Windows)
 # pip install PyBluez

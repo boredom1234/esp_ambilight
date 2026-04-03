@@ -61,6 +61,12 @@ pip install -r requirements.txt
 - `numpy` - Image processing
 - `Pillow` - Screen capture
 - `pyserial` - USB serial communication
+- `dxcam` - Low-latency screen capture on Windows (recommended)
+
+If `dxcam` is unavailable, the app automatically falls back to `Pillow` capture.
+
+You can manually select capture backend in the GUI:
+**Settings -> Capture Backend -> Auto / DXCam / Pillow**
 
 **Optional for Bluetooth:**
 ```bash

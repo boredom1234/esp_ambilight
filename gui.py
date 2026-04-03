@@ -6,6 +6,7 @@ import threading
 import time
 import json
 import os
+import re
 import numpy as np
 from PIL import ImageGrab, Image, ImageTk
 import config
@@ -13,6 +14,14 @@ from connection_manager import ConnectionManager, SERIAL_AVAILABLE, WEBSOCKET_AV
 import image_processor
 import effects
 from network_scanner import NetworkScanner
+
+try:
+    import dxcam
+
+    DXCAM_AVAILABLE = True
+except ImportError:
+    DXCAM_AVAILABLE = False
+    print("Warning: dxcam not installed. Using Pillow ImageGrab capture.")
 
 # Optional import for system tray
 try:
@@ -65,6 +74,15 @@ class AmbilightController:
         self.current_brightness = 255
         self.current_smoothing = 0.0
         self._lock = threading.Lock()
+        self.low_latency_mode = config.LOW_LATENCY_DEFAULT
+        self._adaptive_fps = 60
+        self._capture_thread = None
+        self.capture_backend_pref = tk.StringVar(value="Auto")
+        self.capture_backend = "dxcam" if DXCAM_AVAILABLE else "pil"
+        self._dxcam = None
+        self._dxcam_device_idx = 0
+        self._dxcam_output_idx = 0
+        self._dxcam_started = False
 
         # Capture settings
         self.capture_mode = tk.StringVar(value="Screen Map")
@@ -120,44 +138,43 @@ class AmbilightController:
             self._setup_tray()
 
     def create_ui(self):
-        """Build the modern sidebar UI."""
-        
-        # Main container with two columns
-        # Column 0: Sidebar (fixed width)
-        # Column 1: Content (expands)
+        """Build the primary shell layout."""
+
+        # Main container with two columns:
+        # Column 0: Sidebar (fixed width), Column 1: Content (expands)
+        self.root.grid_columnconfigure(0, weight=0, minsize=220)
         self.root.grid_columnconfigure(1, weight=1)
         self.root.grid_rowconfigure(0, weight=1)
 
-        # ===== Sidebar =====
+        # Sidebar
         self.sidebar = ttk.Frame(self.root, bootstyle="dark")
         self.sidebar.grid(row=0, column=0, sticky="ns")
-        
-        # App Logo/Title
+        self.sidebar.grid_propagate(False)
+
+        # App title
         title_frame = ttk.Frame(self.sidebar, bootstyle="dark")
-        title_frame.pack(fill="x", pady=20, padx=10)
-        
+        title_frame.pack(fill="x", pady=18, padx=14)
+
         lbl_title = ttk.Label(
-            title_frame, 
-            text="Ambilight", 
-            font=("Helvetica", 16, "bold"), 
+            title_frame,
+            text="Ambilight",
+            font=("Segoe UI", 18, "bold"),
             bootstyle="inverse-dark"
         )
         lbl_title.pack(anchor="center")
-        
+
         lbl_subtitle = ttk.Label(
-            title_frame, 
-            text="Controller", 
-            font=("Helvetica", 10), 
+            title_frame,
+            text="Controller",
+            font=("Segoe UI", 10),
             bootstyle="inverse-dark"
         )
         lbl_subtitle.pack(anchor="center")
 
-        # Separator
-        ttk.Separator(self.sidebar, bootstyle="secondary").pack(fill="x", padx=10, pady=10)
+        ttk.Separator(self.sidebar, bootstyle="secondary").pack(fill="x", padx=14, pady=8)
 
-        # Navigation Buttons
+        # Navigation
         self.nav_var = tk.StringVar(value="Dashboard")
-        
         self.create_nav_button("Dashboard", "Dashboard")
         self.create_nav_button("Connection", "Connection")
         self.create_nav_button("Calibration", "Calibration")
@@ -166,24 +183,22 @@ class AmbilightController:
         # Spacer
         ttk.Frame(self.sidebar, bootstyle="dark").pack(fill="both", expand=True)
 
-        # Connection Status in Sidebar
+        # Sidebar transport status
         self.sidebar_status = ttk.Label(
-            self.sidebar, 
-            text="Disconnected", 
+            self.sidebar,
+            text="Disconnected",
             bootstyle="danger-inverse",
             font=("Segoe UI", 9, "bold"),
-            padding=5
+            padding=6
         )
-        self.sidebar_status.pack(side="bottom", fill="x", padx=10, pady=20)
+        self.sidebar_status.pack(side="bottom", fill="x", padx=14, pady=16)
 
-
-        # ===== Content Area =====
-        self.content_area = ttk.Frame(self.root, padding=20)
+        # Content
+        self.content_area = ttk.Frame(self.root, padding=(18, 14))
         self.content_area.grid(row=0, column=1, sticky="nsew")
 
-        # Initialize Views
+        # Views
         self.views = {}
-        
         self.views["Dashboard"] = self.create_dashboard_view()
         self.views["Connection"] = self.create_connection_view()
         self.views["Calibration"] = self.create_calibration_view()
@@ -200,10 +215,10 @@ class AmbilightController:
             variable=self.nav_var,
             value=view_name,
             command=lambda: self.show_view(view_name),
-            bootstyle="toolbutton-dark", 
-            width=15
+            bootstyle="toolbutton-dark",
+            width=18
         )
-        btn.pack(pady=5, padx=10)
+        btn.pack(fill="x", pady=4, padx=14)
 
     def show_view(self, view_name):
         """Switch the visible view in the content area."""
@@ -222,9 +237,195 @@ class AmbilightController:
     def create_dashboard_view(self):
         """Create the main dashboard view."""
         frame = ttk.Frame(self.content_area)
-        
-        # Header
-        ttk.Label(frame, text="Dashboard", font=("Segoe UI", 24)).pack(anchor="w", pady=(0, 20))
+        frame.grid_columnconfigure(0, weight=3)
+        frame.grid_columnconfigure(1, weight=2)
+        frame.grid_rowconfigure(2, weight=1)
+
+        ttk.Label(frame, text="Dashboard", font=("Segoe UI", 24)).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 14)
+        )
+
+        left_col = ttk.Frame(frame)
+        left_col.grid(row=1, column=0, rowspan=2, sticky="nsew", padx=(0, 10))
+        left_col.grid_columnconfigure(0, weight=1)
+        left_col.grid_rowconfigure(2, weight=1)
+
+        right_col = ttk.Frame(frame)
+        right_col.grid(row=1, column=1, rowspan=2, sticky="nsew", padx=(10, 0))
+        right_col.grid_columnconfigure(0, weight=1)
+
+        control_frame = ttk.Labelframe(
+            left_col, text="Session Control", padding=14, bootstyle="primary"
+        )
+        control_frame.grid(row=0, column=0, sticky="ew")
+        control_frame.grid_columnconfigure(0, weight=1)
+        control_frame.grid_columnconfigure(1, weight=1)
+
+        self.start_btn = ttk.Button(
+            control_frame,
+            text="Start",
+            command=self.start_ambilight,
+            bootstyle="success",
+            width=16,
+        )
+        self.start_btn.grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+        self.stop_btn = ttk.Button(
+            control_frame,
+            text="Stop",
+            command=self.stop_ambilight,
+            state="disabled",
+            bootstyle="danger",
+            width=16,
+        )
+        self.stop_btn.grid(row=0, column=1, sticky="w")
+
+        ttk.Button(
+            control_frame,
+            text="Clear LEDs",
+            command=self.force_clear_leds,
+            bootstyle="secondary-outline",
+            width=16,
+        ).grid(row=1, column=0, sticky="w", pady=(10, 0))
+
+        self.dashboard_status = ttk.Label(
+            control_frame,
+            text="System Ready",
+            font=("Segoe UI", 11, "bold"),
+            anchor="e",
+        )
+        self.dashboard_status.grid(row=1, column=1, sticky="e", pady=(10, 0))
+
+        runtime_frame = ttk.Labelframe(
+            left_col, text="Runtime Status", padding=12, bootstyle="secondary"
+        )
+        runtime_frame.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        runtime_frame.grid_columnconfigure(0, weight=1)
+
+        self.runtime_status_label = ttk.Label(
+            runtime_frame,
+            text="Idle | FPS:0 Sent:0/s Drop:0/s TX p95:0.0ms Cap:-",
+            font=("Consolas", 10),
+        )
+        self.runtime_status_label.grid(row=0, column=0, sticky="w")
+
+        live_frame = ttk.Labelframe(
+            left_col, text="Live Adjustments", padding=12, bootstyle="info"
+        )
+        live_frame.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        live_frame.grid_columnconfigure(1, weight=1)
+
+        ttk.Label(live_frame, text="Brightness").grid(row=0, column=0, sticky="w")
+        self.brightness_scale = ttk.Scale(
+            live_frame,
+            from_=0,
+            to=100,
+            command=self._on_brightness_scale,
+            bootstyle="warning",
+        )
+        self.brightness_scale.grid(row=0, column=1, sticky="ew", padx=10)
+        self.lbl_brightness = ttk.Label(live_frame, text="100%", width=6, anchor="e")
+        self.lbl_brightness.grid(row=0, column=2, sticky="e")
+        self.brightness_scale.set(100)
+
+        ttk.Label(live_frame, text="Smoothing").grid(
+            row=1, column=0, sticky="w", pady=(12, 0)
+        )
+        self.smooth_scale = ttk.Scale(
+            live_frame,
+            from_=0,
+            to=90,
+            command=self._on_smoothing_scale,
+            bootstyle="primary",
+        )
+        self.smooth_scale.grid(row=1, column=1, sticky="ew", padx=10, pady=(12, 0))
+        self.lbl_smoothing = ttk.Label(live_frame, text="0%", width=6, anchor="e")
+        self.lbl_smoothing.grid(row=1, column=2, sticky="e", pady=(12, 0))
+        self.smooth_scale.set(0)
+
+        mode_frame = ttk.Labelframe(
+            right_col, text="Output Mode", padding=12, bootstyle="secondary"
+        )
+        mode_frame.grid(row=0, column=0, sticky="ew")
+
+        for row, mode in enumerate(["Screen Capture", "Static Color", "Effect"]):
+            ttk.Radiobutton(
+                mode_frame,
+                text=mode,
+                variable=self.output_mode,
+                value=mode,
+                command=self._on_output_mode_change,
+            ).grid(row=row, column=0, sticky="w", pady=4)
+
+        details_frame = ttk.Frame(right_col)
+        details_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        details_frame.grid_columnconfigure(0, weight=1)
+
+        self.static_ctrl_frame = ttk.Labelframe(
+            details_frame, text="Static Color Settings", padding=12
+        )
+        self.static_ctrl_frame.grid(row=0, column=0, sticky="ew")
+        self.static_ctrl_frame.grid_columnconfigure(4, weight=1)
+
+        self.static_color_preview = tk.Canvas(
+            self.static_ctrl_frame,
+            width=24,
+            height=24,
+            bg=self._rgb_to_hex(self.static_color),
+            highlightthickness=1,
+        )
+        self.static_color_preview.grid(row=0, column=0, padx=(0, 8), sticky="w")
+
+        ttk.Button(
+            self.static_ctrl_frame, text="Pick Color", command=self._pick_color
+        ).grid(row=0, column=1, padx=(0, 10), sticky="w")
+
+        ttk.Label(self.static_ctrl_frame, text="Preset").grid(
+            row=0, column=2, padx=(0, 6), sticky="w"
+        )
+        self.preset_combo = ttk.Combobox(
+            self.static_ctrl_frame,
+            textvariable=self.selected_preset,
+            values=list(self.presets.keys()),
+            state="readonly",
+            width=14,
+        )
+        self.preset_combo.grid(row=0, column=3, padx=(0, 8), sticky="w")
+        self.preset_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
+
+        ttk.Button(
+            self.static_ctrl_frame,
+            text="Save Preset",
+            command=self._save_preset,
+            bootstyle="outline",
+        ).grid(row=0, column=4, sticky="e")
+
+        self.effect_ctrl_frame = ttk.Labelframe(
+            details_frame, text="Effect Settings", padding=12
+        )
+        self.effect_ctrl_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        self.effect_ctrl_frame.grid_columnconfigure(3, weight=1)
+
+        ttk.Label(self.effect_ctrl_frame, text="Effect").grid(row=0, column=0, sticky="w")
+        self.effect_combo = ttk.Combobox(
+            self.effect_ctrl_frame,
+            textvariable=self.current_effect,
+            values=list(effects.EFFECTS.keys()),
+            state="readonly",
+            width=16,
+        )
+        self.effect_combo.grid(row=0, column=1, padx=(8, 14), sticky="w")
+
+        ttk.Label(self.effect_ctrl_frame, text="Speed").grid(row=0, column=2, sticky="w")
+        ttk.Scale(
+            self.effect_ctrl_frame,
+            variable=self.effect_speed,
+            from_=0.1,
+            to=3.0,
+        ).grid(row=0, column=3, sticky="ew", padx=(8, 0))
+
+        self._on_output_mode_change()
+        return frame
 
         # Big Start/Stop Controls
         control_frame = ttk.Labelframe(frame, text="Master Control", padding=15, bootstyle="primary")
@@ -358,94 +559,124 @@ class AmbilightController:
     def create_connection_view(self):
         """Create the connection settings view."""
         frame = ttk.Frame(self.content_area)
-        
-        ttk.Label(frame, text="Connection", font=("Segoe UI", 24)).pack(anchor="w", pady=(0, 20))
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(2, weight=1)
 
-        # Mode Selection
-        mode_frame = ttk.Frame(frame)
-        mode_frame.pack(fill="x", pady=10)
-        
-        ttk.Label(mode_frame, text="Connection Method:", font=("Segoe UI", 12)).pack(anchor="w")
-        
-        radio_frame = ttk.Frame(mode_frame)
-        radio_frame.pack(fill="x", pady=5)
-        
+        ttk.Label(frame, text="Connection", font=("Segoe UI", 24)).grid(
+            row=0, column=0, sticky="w", pady=(0, 14)
+        )
+
+        method_frame = ttk.Labelframe(
+            frame, text="Connection Method", padding=12, bootstyle="secondary"
+        )
+        method_frame.grid(row=1, column=0, sticky="ew")
+
         if SERIAL_AVAILABLE:
             ttk.Radiobutton(
-                radio_frame, text="USB Serial", variable=self.connection_mode, value="USB", command=self._update_conn_ui
-            ).pack(side="left", padx=20)
-            
+                method_frame,
+                text="USB Serial",
+                variable=self.connection_mode,
+                value="USB",
+                command=self._update_conn_ui,
+            ).grid(row=0, column=0, sticky="w", padx=(0, 18))
+
         if WEBSOCKET_AVAILABLE:
             ttk.Radiobutton(
-                radio_frame, text="Wi-Fi (WebSocket)", variable=self.connection_mode, value="WebSocket", command=self._update_conn_ui
-            ).pack(side="left", padx=20)
+                method_frame,
+                text="Wi-Fi (WebSocket)",
+                variable=self.connection_mode,
+                value="WebSocket",
+                command=self._update_conn_ui,
+            ).grid(row=0, column=1, sticky="w")
 
-        # USB Settings Panel
-        self.usb_panel = ttk.Labelframe(frame, text="USB Configuration", padding=15)
-        
-        u_row = ttk.Frame(self.usb_panel)
-        u_row.pack(fill="x")
-        ttk.Label(u_row, text="Port:").pack(side="left")
-        self.port_combo = ttk.Combobox(u_row, width=20, state="readonly")
-        self.port_combo.pack(side="left", padx=10)
-        ttk.Button(u_row, text="Refresh", command=self.refresh_ports, bootstyle="outline").pack(side="left")
+        config_grid = ttk.Frame(frame)
+        config_grid.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        config_grid.grid_columnconfigure(0, weight=1)
+        config_grid.grid_columnconfigure(1, weight=1)
 
-        # Wi-Fi Settings Panel
-        self.ws_panel = ttk.Labelframe(frame, text="Wi-Fi Configuration", padding=15)
-        
-        w_row = ttk.Frame(self.ws_panel)
-        w_row.pack(fill="x", pady=5)
-        
-        ttk.Label(w_row, text="Device IP:").pack(side="left")
+        self.usb_panel = ttk.Labelframe(
+            config_grid, text="USB Configuration", padding=14, bootstyle="info"
+        )
+        self.usb_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        self.usb_panel.grid_columnconfigure(1, weight=1)
+
+        ttk.Label(self.usb_panel, text="Port").grid(row=0, column=0, sticky="w")
+        self.port_combo = ttk.Combobox(self.usb_panel, width=22, state="readonly")
+        self.port_combo.grid(row=0, column=1, sticky="ew", padx=(8, 8))
+        ttk.Button(
+            self.usb_panel, text="Refresh", command=self.refresh_ports, bootstyle="outline"
+        ).grid(row=0, column=2, sticky="e")
+
+        self.ws_panel = ttk.Labelframe(
+            config_grid, text="Wi-Fi Configuration", padding=14, bootstyle="info"
+        )
+        self.ws_panel.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        self.ws_panel.grid_columnconfigure(1, weight=1)
+
+        ttk.Label(self.ws_panel, text="Device IP").grid(row=0, column=0, sticky="w")
         self.ip_var = tk.StringVar(value=config.DEFAULT_IP)
-        self.ip_combo = ttk.Combobox(w_row, textvariable=self.ip_var, width=25)
-        self.ip_combo.pack(side="left", padx=10)
-        
-        # Scan Panel
-        scan_frame = ttk.Frame(self.ws_panel)
-        scan_frame.pack(fill="x", pady=10)
-        
-        self.scan_btn = ttk.Button(scan_frame, text="Scan Network", command=self.scan_network, bootstyle="info")
-        self.scan_btn.pack(side="left")
-        
-        self.scan_status_label = ttk.Label(scan_frame, text="", foreground="gray")
-        self.scan_status_label.pack(side="left", padx=10)
+        self.ip_combo = ttk.Combobox(self.ws_panel, textvariable=self.ip_var, width=25)
+        self.ip_combo.grid(row=0, column=1, sticky="ew", padx=(8, 8))
 
-        # Connect Button Area
-        action_frame = ttk.Frame(frame, padding=20)
-        action_frame.pack(fill="x", pady=20)
-        
-        ttk.Button(
-            action_frame, 
-            text="Connect Now", 
-            command=self.connect_device, 
+        self.scan_btn = ttk.Button(
+            self.ws_panel, text="Scan Network", command=self.scan_network, bootstyle="info"
+        )
+        self.scan_btn.grid(row=1, column=0, sticky="w", pady=(10, 0))
+        self.scan_status_label = ttk.Label(self.ws_panel, text="", foreground="gray")
+        self.scan_status_label.grid(row=1, column=1, sticky="w", pady=(10, 0))
+
+        action_frame = ttk.Frame(frame, padding=(0, 14, 0, 0))
+        action_frame.grid(row=3, column=0, sticky="ew")
+        action_frame.grid_columnconfigure(0, weight=1)
+        action_frame.grid_columnconfigure(1, weight=0)
+        action_frame.grid_columnconfigure(2, weight=0)
+
+        self.connection_hint_label = ttk.Label(
+            action_frame, text="Choose mode and target, then connect."
+        )
+        self.connection_hint_label.grid(row=0, column=0, sticky="w")
+
+        self.connect_btn = ttk.Button(
+            action_frame,
+            text="Connect",
+            command=self.connect_device,
             bootstyle="success",
-            width=20
-        ).pack(side="left")
-        
-        ttk.Button(
-            action_frame, 
-            text="Disconnect", 
-            command=self.disconnect_device, 
-            bootstyle="danger",
-            width=20
-        ).pack(side="left", padx=20)
+            width=16,
+        )
+        self.connect_btn.grid(row=0, column=1, padx=(8, 8))
 
-        # Default UI state
+        self.disconnect_btn = ttk.Button(
+            action_frame,
+            text="Disconnect",
+            command=self.disconnect_device,
+            bootstyle="danger",
+            width=16,
+        )
+        self.disconnect_btn.grid(row=0, column=2)
+
         self._update_conn_ui()
-        
         return frame
 
     def _update_conn_ui(self):
         """Show/Hide panels based on connection mode."""
         mode = self.connection_mode.get()
-        self.usb_panel.pack_forget()
-        self.ws_panel.pack_forget()
-        
-        if mode == "USB":
-            self.usb_panel.pack(fill="x", pady=10)
-        elif mode == "WebSocket":
-            self.ws_panel.pack(fill="x", pady=10)
+        if hasattr(self, "usb_panel"):
+            self.usb_panel.grid_remove()
+        if hasattr(self, "ws_panel"):
+            self.ws_panel.grid_remove()
+
+        if mode == "USB" and hasattr(self, "usb_panel"):
+            self.usb_panel.grid()
+            if hasattr(self, "connection_hint_label"):
+                self.connection_hint_label.config(
+                    text="Select USB serial port, then connect."
+                )
+        elif mode == "WebSocket" and hasattr(self, "ws_panel"):
+            self.ws_panel.grid()
+            if hasattr(self, "connection_hint_label"):
+                self.connection_hint_label.config(
+                    text="Enter ESP32 IP or scan network, then connect."
+                )
 
     def create_calibration_view(self):
         """Create the calibration view."""
@@ -492,8 +723,115 @@ class AmbilightController:
     def create_settings_view(self):
         """Create the settings view."""
         frame = ttk.Frame(self.content_area)
-        
-        ttk.Label(frame, text="Settings", font=("Segoe UI", 24)).pack(anchor="w", pady=(0, 20))
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(2, weight=1)
+
+        ttk.Label(frame, text="Settings", font=("Segoe UI", 24)).grid(
+            row=0, column=0, sticky="w", pady=(0, 14)
+        )
+
+        cap_frame = ttk.Labelframe(
+            frame, text="Capture Settings", padding=14, bootstyle="secondary"
+        )
+        cap_frame.grid(row=1, column=0, sticky="ew")
+        cap_frame.grid_columnconfigure(1, weight=1)
+
+        ttk.Label(cap_frame, text="Target Monitor").grid(
+            row=0, column=0, sticky="w", pady=5
+        )
+        self.monitor_combo = ttk.Combobox(
+            cap_frame,
+            textvariable=self.selected_monitor,
+            state="readonly",
+            width=40,
+        )
+        self.monitor_combo.grid(row=0, column=1, padx=(10, 10), sticky="ew")
+        ttk.Button(
+            cap_frame, text="Refresh", command=self.refresh_monitors, bootstyle="outline"
+        ).grid(row=0, column=2, sticky="e")
+
+        ttk.Label(cap_frame, text="Algorithm").grid(row=1, column=0, sticky="w", pady=5)
+        self.algo_combo = ttk.Combobox(
+            cap_frame,
+            textvariable=self.capture_mode,
+            values=[
+                "Screen Map",
+                "Average Color",
+                "Dominant Color",
+                "Edge Sampling",
+                "Quadrant Colors",
+                "Most Vibrant",
+                "Warm Bias",
+                "Cool Bias",
+            ],
+            state="readonly",
+            width=25,
+        )
+        self.algo_combo.grid(row=1, column=1, padx=(10, 10), sticky="w")
+
+        ttk.Label(cap_frame, text="Target FPS").grid(row=2, column=0, sticky="w", pady=5)
+        self.fps_var = tk.StringVar(value="60")
+        self.fps_combo = ttk.Combobox(
+            cap_frame,
+            textvariable=self.fps_var,
+            values=["15", "20", "30", "45", "60", "90", "120"],
+            width=10,
+            state="readonly",
+        )
+        self.fps_combo.grid(row=2, column=1, padx=(10, 10), sticky="w")
+
+        ttk.Label(cap_frame, text="Capture Backend").grid(
+            row=3, column=0, sticky="w", pady=5
+        )
+        self.backend_combo = ttk.Combobox(
+            cap_frame,
+            textvariable=self.capture_backend_pref,
+            values=["Auto", "DXCam", "Pillow"],
+            width=15,
+            state="readonly",
+        )
+        self.backend_combo.grid(row=3, column=1, padx=(10, 10), sticky="w")
+
+        reg_frame = ttk.Labelframe(
+            frame,
+            text="Advanced Capture Region",
+            padding=14,
+            bootstyle="warning",
+        )
+        reg_frame.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+
+        ttk.Checkbutton(
+            reg_frame,
+            text="Enable Custom Region",
+            variable=self.use_custom_region,
+            command=self.toggle_region_inputs,
+        ).grid(row=0, column=0, sticky="w")
+
+        self.reg_input_frame = ttk.Frame(reg_frame)
+        self.reg_input_frame.grid(row=1, column=0, sticky="w", pady=(10, 0))
+
+        validate_cmd = (self.root.register(self.validate_percent), "%P")
+        for label, var in [
+            ("X %", self.region_x),
+            ("Y %", self.region_y),
+            ("Width %", self.region_w),
+            ("Height %", self.region_h),
+        ]:
+            sub = ttk.Frame(self.reg_input_frame)
+            sub.pack(side="left", padx=(0, 12))
+            ttk.Label(sub, text=label).pack(anchor="w")
+            e = ttk.Entry(
+                sub,
+                width=6,
+                textvariable=var,
+                validate="key",
+                validatecommand=validate_cmd,
+            )
+            e.pack(anchor="w")
+            setattr(self, f"ent_{label[0].lower()}", e)
+
+        self.toggle_region_inputs()
+        return frame
 
         # Capture Settings
         cap_frame = ttk.Labelframe(frame, text="Capture Settings", padding=15)
@@ -531,6 +869,19 @@ class AmbilightController:
             state="readonly"
         )
         self.fps_combo.grid(row=2, column=1, padx=10, sticky="w")
+
+        # Capture Backend
+        ttk.Label(cap_frame, text="Capture Backend:").grid(
+            row=3, column=0, sticky="w", pady=5
+        )
+        self.backend_combo = ttk.Combobox(
+            cap_frame,
+            textvariable=self.capture_backend_pref,
+            values=["Auto", "DXCam", "Pillow"],
+            width=15,
+            state="readonly",
+        )
+        self.backend_combo.grid(row=3, column=1, padx=10, sticky="w")
 
         # Custom Region
         reg_frame = ttk.Labelframe(frame, text="Custom Capture Region (Advanced)", padding=15)
@@ -580,7 +931,10 @@ class AmbilightController:
 
     def toggle_region_inputs(self):
         state = "normal" if self.use_custom_region.get() else "disabled"
-        for widget in self.reg_input_frame.winfo_children():
+        stack = list(self.reg_input_frame.winfo_children())
+        while stack:
+            widget = stack.pop()
+            stack.extend(widget.winfo_children())
             if isinstance(widget, ttk.Entry):
                 widget.config(state=state)
 
@@ -625,9 +979,13 @@ class AmbilightController:
 
     def connect_device(self):
         mode = self.connection_mode.get()
-        
+
         self.sidebar_status.config(text="Connecting...", bootstyle="warning-inverse")
         self.dashboard_status.config(text="Connecting...", foreground="orange")
+        if hasattr(self, "runtime_status_label"):
+            self.runtime_status_label.config(
+                text=f"Connecting via {mode}..."
+            )
         self.root.update()
 
         success = False
@@ -645,15 +1003,25 @@ class AmbilightController:
         if success:
             self.sidebar_status.config(text="Connected", bootstyle="success-inverse")
             self.dashboard_status.config(text="Connected", foreground="green")
+            if hasattr(self, "connection_hint_label"):
+                self.connection_hint_label.config(text="Connected.")
         else:
             self.sidebar_status.config(text="Failed", bootstyle="danger-inverse")
             self.dashboard_status.config(text="Connection Failed", foreground="red")
+            if hasattr(self, "connection_hint_label"):
+                self.connection_hint_label.config(
+                    text="Connection failed. Verify target and try again."
+                )
             messagebox.showerror("Error", "Could not connect to device")
 
     def disconnect_device(self):
         self.conn.disconnect()
         self.sidebar_status.config(text="Disconnected", bootstyle="danger-inverse")
         self.dashboard_status.config(text="Disconnected", foreground="red")
+        if hasattr(self, "runtime_status_label"):
+            self.runtime_status_label.config(text="Idle | Disconnected")
+        if hasattr(self, "connection_hint_label"):
+            self.connection_hint_label.config(text="Disconnected.")
 
     def _on_connected(self, mode, details):
         self.num_leds = self.conn.led_count
@@ -663,13 +1031,31 @@ class AmbilightController:
             self.sidebar_status.config(text=f"Connected ({mode})", bootstyle="success-inverse")
             self.dashboard_status.config(text=f"Online - {self.num_leds} LEDs", foreground="green")
             self.info_label.config(text=f"Connected! Found {self.num_leds} LEDs.")
+            if hasattr(self, "runtime_status_label"):
+                self.runtime_status_label.config(
+                    text=f"Connected via {mode.upper()} | LEDs:{self.num_leds}"
+                )
             # Sync LED count field
             self.led_count_var.set(str(self.num_leds))
             
         self.root.after(0, ui_update)
 
     def _on_disconnected(self):
-        self.root.after(0, lambda: self.sidebar_status.config(text="Disconnected", bootstyle="danger-inverse"))
+        def ui_update():
+            if self.conn.reconnecting and self.connection_mode.get() == "WebSocket":
+                self.sidebar_status.config(
+                    text="Reconnecting...", bootstyle="warning-inverse"
+                )
+                self.dashboard_status.config(text="Reconnecting WS...", foreground="orange")
+                if hasattr(self, "runtime_status_label"):
+                    self.runtime_status_label.config(text="Reconnecting WebSocket...")
+            else:
+                self.sidebar_status.config(text="Disconnected", bootstyle="danger-inverse")
+                self.dashboard_status.config(text="Disconnected", foreground="red")
+                if hasattr(self, "runtime_status_label"):
+                    self.runtime_status_label.config(text="Idle | Disconnected")
+
+        self.root.after(0, ui_update)
 
     def _on_message(self, data):
         if data.get("type") == "info":
@@ -680,8 +1066,20 @@ class AmbilightController:
                 self.root.after(0, lambda: self.led_count_var.set(str(new_count)))
 
     def _on_error(self, err):
-        # self.root.after(0, lambda: messagebox.showerror("Error", err))
         print(f"Error: {err}")
+        self.root.after(
+            0,
+            lambda: self.dashboard_status.config(
+                text=f"Transport error: {err[:80]}", foreground="orange"
+            ),
+        )
+        if hasattr(self, "runtime_status_label"):
+            self.root.after(
+                0,
+                lambda: self.runtime_status_label.config(
+                    text=f"Transport error: {err[:80]}"
+                ),
+            )
 
     # ===== Calibration Logic =====
 
@@ -784,108 +1182,117 @@ class AmbilightController:
         if not self.conn.connected:
             messagebox.showwarning("Warning", "Connect first!")
             return
+        if self.is_running:
+            return
         
         self.is_running = True
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self.dashboard_status.config(text="RUNNING", foreground="green")
+        if hasattr(self, "runtime_status_label"):
+            self.runtime_status_label.config(text="Starting capture loop...")
+        try:
+            self._adaptive_fps = max(15, int(self.fps_var.get() or "60"))
+        except ValueError:
+            self._adaptive_fps = 60
+        self._start_capture_backend()
         
-        self.capture_thread = threading.Thread(target=self.capture_loop, daemon=True)
-        self.capture_thread.start()
+        self._capture_thread = threading.Thread(target=self.capture_loop, daemon=True)
+        self._capture_thread.start()
 
     def stop_ambilight(self):
         self.is_running = False
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
         self.dashboard_status.config(text="STOPPED", foreground="red")
-        
-        time.sleep(0.1)
+        if hasattr(self, "runtime_status_label"):
+            self.runtime_status_label.config(text="Stopped")
+        self._stop_capture_backend()
         if self.conn.connected:
-             self.conn.send_command({"cmd": "clear"})
+            self.conn.send_command({"cmd": "clear"})
 
     def capture_loop(self):
         """Main capture loop - runs in background thread."""
-        frame_count = 0
-        
+        next_tick = time.perf_counter()
+        loop_sent = 0
+        loop_dropped = 0
+        last_status_push = time.time()
+
         while self.is_running:
-            # Check fps each frame to allow dynamic update
             try:
-                fps = int(self.fps_var.get())
+                requested_fps = int(self.fps_var.get())
             except ValueError:
-                fps = 60
-            
-            delay = 1.0 / fps
-            start_time = time.time()
-            
+                requested_fps = 60
+
+            requested_fps = max(15, min(120, requested_fps))
+            effective_fps = self._get_effective_fps(requested_fps)
+            interval = 1.0 / max(1, effective_fps)
+            send_ok = False
+
             try:
-                # Check output mode
                 output_mode = self.output_mode.get()
 
-                # Handle Static Color mode
                 if output_mode == "Static Color":
-                    self._apply_static_color()
-                    time.sleep(delay)
-                    continue
-
-                # Handle Effect mode
-                if output_mode == "Effect":
-                    self._run_effect_step()
-                    time.sleep(delay)
-                    continue
-
-                # Screen Capture mode
-                bbox = self.get_capture_bbox()
-                
-                # Capture screen
-                # Note: bbox=None means all screens (or primary depending on impl), 
-                # but if we have specific bbox we use it.
-                if bbox:
-                    screen = ImageGrab.grab(bbox=bbox, all_screens=True)
+                    send_ok = self._apply_static_color()
+                elif output_mode == "Effect":
+                    send_ok = self._run_effect_step()
                 else:
-                    # Fallback if no bbox returned (shouldn't happen if logic is correct)
-                    screen = ImageGrab.grab()
+                    bbox = self.get_capture_bbox()
+                    frame = self._grab_frame(bbox)
+                    if frame is None:
+                        send_ok = False
+                        time.sleep(0.005)
+                        continue
 
-                # Resize keeping aspect ratio to avoid distortion/improve perf
-                sw, sh = screen.size
-                target_w = 160 # Reduced from full screen for processing
-                target_h = max(1, int(target_w * (sh / sw)))
-                screen = screen.resize((target_w, target_h))
+                    sh, sw = frame.shape[:2]
+                    target_w = 160
+                    if effective_fps >= 90:
+                        target_w = 128
+                    pixels = self._fast_resize_frame(frame, target_w)
+                    brightness = self.current_brightness
+                    led_colors = self.process_image(pixels, brightness)
+                    smooth_factor = self.current_smoothing
 
-                pixels = np.array(screen)
-                
-                # Use thread-safe variable
-                brightness = self.current_brightness
+                    with self._lock:
+                        if (
+                            self.prev_colors is not None
+                            and len(self.prev_colors) == len(led_colors)
+                        ):
+                            smoothed = bytearray(len(led_colors))
+                            for i in range(len(led_colors)):
+                                smoothed[i] = int(
+                                    self.prev_colors[i] * smooth_factor
+                                    + led_colors[i] * (1 - smooth_factor)
+                                )
+                            led_colors = smoothed
 
-                # Process based on capture mode
-                led_colors = self.process_image(pixels, brightness)
+                        self.prev_colors = bytearray(led_colors)
 
-                # Apply smoothing with thread safety
-                smooth_factor = self.current_smoothing
+                    send_ok = self.conn.send_colors(bytes(led_colors))
 
-                with self._lock:
-                    if self.prev_colors is not None and len(self.prev_colors) == len(led_colors):
-                        smoothed = bytearray(len(led_colors))
-                        for i in range(len(led_colors)):
-                            smoothed[i] = int(
-                                self.prev_colors[i] * smooth_factor
-                                + led_colors[i] * (1 - smooth_factor)
-                            )
-                        led_colors = smoothed
-
-                    self.prev_colors = bytearray(led_colors)
-
-                # Send to device
-                self.conn.send_colors(bytes(led_colors))
-                
             except Exception as e:
                 print(f"Capture loop error: {e}")
-                # Don't spam errors
-                time.sleep(1.0)
+                send_ok = False
+                time.sleep(0.2)
 
-            # Frame timing
-            elapsed = time.time() - start_time
-            if elapsed < delay:
-                time.sleep(delay - elapsed)
+            if send_ok:
+                loop_sent += 1
+            else:
+                loop_dropped += 1
+
+            now = time.time()
+            if now - last_status_push >= 1.0:
+                self._push_runtime_status(loop_sent, loop_dropped, effective_fps)
+                loop_sent = 0
+                loop_dropped = 0
+                last_status_push = now
+
+            next_tick += interval
+            sleep_for = next_tick - time.perf_counter()
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            else:
+                next_tick = time.perf_counter()
                 
     def get_capture_bbox(self):
         """Calculate capture bounding box based on settings."""
@@ -907,8 +1314,10 @@ class AmbilightController:
                 else:
                     # Fallback to caching primary screen size if available
                      if self._screen_size is None:
-                        fs = ImageGrab.grab()
-                        self._screen_size = fs.size
+                        self._screen_size = (
+                            self.root.winfo_screenwidth(),
+                            self.root.winfo_screenheight(),
+                        )
                      if self._screen_size:
                         mw, mh = self._screen_size
                 
@@ -933,6 +1342,171 @@ class AmbilightController:
             return (m.x, m.y, m.x+m.width, m.y+m.height)
         
         return None
+
+    def _start_capture_backend(self):
+        self._stop_capture_backend()
+        preferred = self._resolve_capture_backend_preference()
+
+        if preferred == "pil":
+            self.capture_backend = "pil"
+            return
+
+        self._dxcam_device_idx, self._dxcam_output_idx = self._resolve_dxcam_target()
+
+        try:
+            self._dxcam = dxcam.create(
+                device_idx=self._dxcam_device_idx,
+                output_idx=self._dxcam_output_idx,
+                output_color="RGB",
+            )
+            # Start internal capture thread once; read newest frame via get_latest_frame().
+            self._dxcam.start(target_fps=120, video_mode=True)
+            self._dxcam_started = True
+            self.capture_backend = "dxcam"
+        except Exception as e:
+            # Retry with primary output before falling back.
+            try:
+                self._dxcam_device_idx = 0
+                self._dxcam_output_idx = 0
+                self._dxcam = dxcam.create(
+                    device_idx=0, output_idx=0, output_color="RGB"
+                )
+                self._dxcam.start(target_fps=120, video_mode=True)
+                self._dxcam_started = True
+                self.capture_backend = "dxcam"
+                print(f"DXCam init recovered on output 0 (initial error: {e})")
+            except Exception as e2:
+                print(f"DXCam init failed, falling back to Pillow: {e2}")
+                self._dxcam = None
+                self._dxcam_started = False
+                self.capture_backend = "pil"
+
+    def _resolve_capture_backend_preference(self):
+        pref = self.capture_backend_pref.get().strip().lower()
+        if pref == "pillow":
+            return "pil"
+        if pref == "dxcam":
+            return "dxcam" if DXCAM_AVAILABLE else "pil"
+        return "dxcam" if DXCAM_AVAILABLE else "pil"
+
+    def _resolve_dxcam_target(self):
+        """Map selected monitor to dxcam (device_idx, output_idx)."""
+        target_monitor = None
+        try:
+            sel = self.monitor_combo.current()
+            if SCREENINFO_AVAILABLE and self.monitors and 0 <= sel < len(self.monitors):
+                target_monitor = self.monitors[sel]
+        except Exception:
+            target_monitor = None
+
+        try:
+            info_text = dxcam.output_info()
+        except Exception:
+            return 0, 0
+
+        entries = []
+        pattern = re.compile(
+            r"Device\[(\d+)\]\s+Output\[(\d+)\]:\s+Res:\((\d+),\s*(\d+)\).*Primary:(True|False)"
+        )
+        for line in str(info_text).splitlines():
+            m = pattern.search(line)
+            if not m:
+                continue
+            entries.append(
+                {
+                    "device_idx": int(m.group(1)),
+                    "output_idx": int(m.group(2)),
+                    "width": int(m.group(3)),
+                    "height": int(m.group(4)),
+                    "primary": m.group(5) == "True",
+                }
+            )
+
+        if not entries:
+            return 0, 0
+
+        if target_monitor is not None:
+            same_res = [
+                e
+                for e in entries
+                if e["width"] == target_monitor.width and e["height"] == target_monitor.height
+            ]
+            candidates = same_res if same_res else entries
+            # Prefer matching primary/non-primary state with selected screen.
+            pref = [e for e in candidates if e["primary"] == bool(target_monitor.is_primary)]
+            chosen = pref[0] if pref else candidates[0]
+            return chosen["device_idx"], chosen["output_idx"]
+
+        primary = [e for e in entries if e["primary"]]
+        chosen = primary[0] if primary else entries[0]
+        return chosen["device_idx"], chosen["output_idx"]
+
+    def _stop_capture_backend(self):
+        if self._dxcam is not None:
+            try:
+                self._dxcam.stop()
+            except Exception:
+                pass
+            self._dxcam_started = False
+            try:
+                del self._dxcam
+            except Exception:
+                pass
+            self._dxcam = None
+
+    def _grab_frame(self, bbox):
+        if (
+            self.capture_backend == "dxcam"
+            and self._dxcam is not None
+            and self._dxcam_started
+        ):
+            try:
+                frame = self._dxcam.get_latest_frame()
+                if frame is not None:
+                    if self.use_custom_region.get():
+                        frame = self._crop_frame_by_percent(frame)
+                    return frame
+            except Exception:
+                # Fallback to PIL for unsupported monitor geometry / DX failures.
+                pass
+
+        if bbox:
+            screen = ImageGrab.grab(bbox=bbox, all_screens=True)
+        else:
+            screen = ImageGrab.grab()
+        return np.array(screen)
+
+    def _crop_frame_by_percent(self, frame):
+        h, w = frame.shape[:2]
+        if w <= 1 or h <= 1:
+            return frame
+        try:
+            x_pct = int(self.region_x.get())
+            y_pct = int(self.region_y.get())
+            w_pct = int(self.region_w.get())
+            h_pct = int(self.region_h.get())
+        except ValueError:
+            return frame
+
+        x0 = int(max(0, min(100, x_pct)) / 100.0 * w)
+        y0 = int(max(0, min(100, y_pct)) / 100.0 * h)
+        x1 = x0 + int(max(1, min(100, w_pct)) / 100.0 * w)
+        y1 = y0 + int(max(1, min(100, h_pct)) / 100.0 * h)
+        x1 = min(w, max(x0 + 1, x1))
+        y1 = min(h, max(y0 + 1, y1))
+        return frame[y0:y1, x0:x1]
+
+    def _fast_resize_frame(self, frame, target_w):
+        h, w = frame.shape[:2]
+        if w <= 0 or h <= 0:
+            return frame
+        if w <= target_w:
+            return frame
+
+        target_h = max(1, int(target_w * (h / w)))
+        x_idx = np.linspace(0, w - 1, target_w, dtype=np.int32)
+        y_idx = np.linspace(0, h - 1, target_h, dtype=np.int32)
+        return frame[np.ix_(y_idx, x_idx)]
 
     def process_image(self, pixels, brightness):
         # Dispatch to image_processor based on algo
@@ -961,16 +1535,48 @@ class AmbilightController:
     def _apply_static_color(self):
         r, g, b = self.static_color
         colors = effects.generate_static_color(self.num_leds, self.current_brightness, r, g, b)
-        self.conn.send_colors(bytes(colors))
+        return self.conn.send_colors(bytes(colors))
 
     def _run_effect_step(self):
-         name = self.current_effect.get()
-         if name in effects.EFFECTS:
-             func = effects.EFFECTS[name]
-             colors = func(self.num_leds, self.current_brightness, self.effect_phase)
-             self.conn.send_colors(bytes(colors))
-             self.effect_phase += 1.0 * self.effect_speed.get()
-             if self.effect_phase > 100: self.effect_phase = 0
+        name = self.current_effect.get()
+        if name in effects.EFFECTS:
+            func = effects.EFFECTS[name]
+            colors = func(self.num_leds, self.current_brightness, self.effect_phase)
+            ok = self.conn.send_colors(bytes(colors))
+            self.effect_phase += 1.0 * self.effect_speed.get()
+            if self.effect_phase > 100:
+                self.effect_phase = 0
+            return ok
+        return False
+
+    def _get_effective_fps(self, requested_fps):
+        if not self.low_latency_mode:
+            self._adaptive_fps = requested_fps
+            return requested_fps
+
+        stats = self.conn.get_stats()
+        p95_send_ms = stats.get("send_ms_p95", 0.0)
+        budget_ms = 1000.0 / max(1, self._adaptive_fps)
+
+        if p95_send_ms > budget_ms * 0.7:
+            self._adaptive_fps = max(20, self._adaptive_fps - 5)
+        elif self._adaptive_fps < requested_fps:
+            self._adaptive_fps += 1
+
+        self._adaptive_fps = min(self._adaptive_fps, requested_fps)
+        return self._adaptive_fps
+
+    def _push_runtime_status(self, loop_sent, loop_dropped, effective_fps):
+        stats = self.conn.get_stats()
+        text = (
+            f"RUNNING | FPS:{effective_fps} Sent:{loop_sent}/s Drop:{loop_dropped}/s "
+            f"TX p95:{stats.get('send_ms_p95', 0.0):.1f}ms Cap:{self.capture_backend.upper()}"
+        )
+        self.root.after(
+            0, lambda: self.dashboard_status.config(text=text, foreground="green")
+        )
+        if hasattr(self, "runtime_status_label"):
+            self.root.after(0, lambda: self.runtime_status_label.config(text=text))
 
     # ===== Misc Helpers =====
     def _rgb_to_hex(self, rgb):
@@ -1034,7 +1640,21 @@ class AmbilightController:
                  self._apply_static_color()
 
     def _on_output_mode_change(self):
-        pass # Captured in loop
+        mode = self.output_mode.get()
+        if not hasattr(self, "static_ctrl_frame") or not hasattr(
+            self, "effect_ctrl_frame"
+        ):
+            return
+
+        if mode == "Static Color":
+            self.static_ctrl_frame.grid()
+            self.effect_ctrl_frame.grid_remove()
+        elif mode == "Effect":
+            self.static_ctrl_frame.grid_remove()
+            self.effect_ctrl_frame.grid()
+        else:
+            self.static_ctrl_frame.grid_remove()
+            self.effect_ctrl_frame.grid_remove()
         
     def force_clear_leds(self):
         if self.conn.connected:
@@ -1102,6 +1722,8 @@ class AmbilightController:
         if self.tray_icon:
             self.tray_icon.stop()
         self.is_running = False
+        self._stop_capture_backend()
+        self.conn.disconnect()
         self.root.after(0, self.root.destroy)
 
     def test_pattern(self):
@@ -1121,6 +1743,7 @@ class AmbilightController:
             "selected_monitor": self.selected_monitor.get(),
             "capture_mode": self.capture_mode.get(),
             "fps": self.fps_var.get(),
+            "capture_backend_pref": self.capture_backend_pref.get(),
         }
 
         try:
@@ -1165,6 +1788,11 @@ class AmbilightController:
             if "fps" in config_data:
                 self.fps_var.set(config_data["fps"])
 
+            if "capture_backend_pref" in config_data:
+                val = config_data["capture_backend_pref"]
+                if val in ["Auto", "DXCam", "Pillow"]:
+                    self.capture_backend_pref.set(val)
+
             self.draw_led_map()
             
             # Update UI elements
@@ -1194,9 +1822,11 @@ class AmbilightController:
         self.scan_status_label.config(text="Scanning...", foreground="blue")
 
         self.network_scanner.scan_network(
-            on_progress=lambda c, t: self.scan_status_label.config(text=f"Scanning: {c}/{t}"),
-            on_device_found=lambda d: self._on_device_found(d),
-            on_complete=lambda d: self._on_scan_complete(d)
+            on_progress=lambda c, t: self.root.after(
+                0, lambda: self.scan_status_label.config(text=f"Scanning: {c}/{t}")
+            ),
+            on_device_found=lambda d: self.root.after(0, lambda: self._on_device_found(d)),
+            on_complete=lambda d: self.root.after(0, lambda: self._on_scan_complete(d))
         )
             
     def _on_device_found(self, device):
